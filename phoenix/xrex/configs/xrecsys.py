@@ -209,6 +209,9 @@ def _make_dataset(
                 multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
                 use_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
+                require_label_observation_masks=mparams.get(
+                    "require_label_observation_masks", False
+                ),
             )
         case "toy_dataset":
             return PhoenixToyDataset(
@@ -312,6 +315,22 @@ _GB300_OVERRIDES = {
     "checkpoint_every_n": 300,
 }
 
+_NANO_OVERRIDES = {
+    "learning_rate": 2e-3,
+    "bs_per_device": 64,
+    "ep": 1,
+    "dp": 1,
+    "attn_impl": "pallas_ranker_varlen_attn",
+    "emb_size": 512,
+    "num_layers": 4,
+    "query_heads": 4,
+    "kv_heads": 2,
+    "emb_table_width": 128,
+    "multimodal_embedding_type": None,
+    "log_q_num_bins": 100_000,
+    "compute_post_unexplored_label": False,
+}
+
 
 MODEL_CFGS = {
     "xrecsys_seqpack": _make_cfg(
@@ -374,19 +393,26 @@ MODEL_CFGS = {
     "home_direct_packed_nano": _make_cfg(
         {
             **_home_direct_packed_base(),
-            "learning_rate": 2e-3,
-            "bs_per_device": 64,
-            "ep": 1,
-            "dp": 1,
-            "attn_impl": "pallas_ranker_varlen_attn",
-            "emb_size": 512,
-            "num_layers": 4,
-            "query_heads": 4,
-            "kv_heads": 2,
-            "emb_table_width": 128,
-            "multimodal_embedding_type": None,
-            "log_q_num_bins": 100_000,
+            **_NANO_OVERRIDES,
+        },
+        user_vocab_size=100_000,
+        item_vocab_size=100_000,
+        author_vocab_size=30_000,
+        ip_vocab_size=10_000,
+    ),
+    # The production Grassy artifact is schema-exact but explicitly lacks
+    # point-in-time engagement-count authority. This named job cannot silently
+    # inherit X defaults: masks are mandatory, raw count embeddings/metrics are
+    # disabled, post-unexplored derivation is disabled, and its one physical
+    # Parquet partition is pinned for the offline reader.
+    "grassy_home_direct_packed_nano": _make_cfg(
+        {
+            **_home_direct_packed_base(),
+            **_NANO_OVERRIDES,
+            "require_label_observation_masks": True,
+            "enable_engagement_counts": False,
             "compute_post_unexplored_label": False,
+            "num_kafka_partitions": 1,
         },
         user_vocab_size=100_000,
         item_vocab_size=100_000,
@@ -556,6 +582,9 @@ for config in configs:
             ),
             metric_group=mparams.get("metric_group", "default"),
             continuous_metrics_mae_mean=mparams.get("continuous_metrics_mae_mean", False),
+            require_label_observation_masks=mparams.get(
+                "require_label_observation_masks", False
+            ),
             emb_table_width=mparams["emb_table_width"],
             history_seq_len=mparams["history_seq_len"],
             candidate_seq_len=mparams["candidate_seq_len"],

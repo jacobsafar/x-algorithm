@@ -30,6 +30,11 @@ from xrex.data.recsys.feature_config import (
     UserFloatFeature,
     UserInt64Feature,
 )
+from xrex.data.recsys.observability import (
+    ACTION_OBSERVATION_MASK_COLUMN,
+    CONTINUOUS_ACTION_OBSERVATION_MASK_COLUMN,
+    extract_observation_mask_column,
+)
 from xrex.models.recsys_embedding import HashKeys, HashTable
 
 if TYPE_CHECKING:
@@ -201,6 +206,8 @@ class PostSeq(TypedDict):
     product_surface: npt.NDArray[np.int32]
     client_app_id: npt.NDArray[np.int32]
     continuous_actions: npt.NDArray[np.float32]
+    action_observation_mask: NotRequired[npt.NDArray[np.bool_] | None]
+    continuous_action_observation_mask: NotRequired[npt.NDArray[np.bool_] | None]
     promoted_ids: npt.NDArray[np.int64] | None
     line_item_objective: npt.NDArray[np.int16] | None
     safety_label_mask: npt.NDArray[np.int64] | None
@@ -391,6 +398,22 @@ def from_record_batch(
             (batch_size, seq_len, num_continuous_actions), dtype=np.float32
         )
 
+    seq_len = actions.shape[1]
+    action_observation_mask = extract_observation_mask_column(
+        record_batch,
+        ACTION_OBSERVATION_MASK_COLUMN,
+        batch_size,
+        seq_len,
+        output_vocab_size,
+    )
+    continuous_action_observation_mask = extract_observation_mask_column(
+        record_batch,
+        CONTINUOUS_ACTION_OBSERVATION_MASK_COLUMN,
+        batch_size,
+        seq_len,
+        num_continuous_actions,
+    )
+
     if "clientAppIdSeq" in record_batch.schema.names:
         client_app_id = _col(record_batch, "clientAppIdSeq", batch_size, np.int32)
     else:
@@ -535,6 +558,14 @@ def from_record_batch(
     history_safety_label_mask = np.zeros(hist_shape_2d, dtype=np.int64)
     history_actions = np.zeros(hist_shape_3d, dtype=actions.dtype)
     history_continuous_actions = np.zeros(hist_shape_3d_continuous, dtype=np.float32)
+    history_action_observation_mask = (
+        np.zeros(hist_shape_3d, dtype=np.bool_) if action_observation_mask is not None else None
+    )
+    history_continuous_action_observation_mask = (
+        np.zeros(hist_shape_3d_continuous, dtype=np.bool_)
+        if continuous_action_observation_mask is not None
+        else None
+    )
 
     hist_categorical_features = np.zeros(
         (batch_size, max_history_post_action_pairs, POST_CATEGORICAL_FEATURE_SIZE),
@@ -564,6 +595,14 @@ def from_record_batch(
     candidate_actions = np.zeros(cand_shape_3d, dtype=actions.dtype)
     candidate_continuous_actions = np.zeros(
         cand_shape_3d_continuous, dtype=continuous_actions.dtype
+    )
+    candidate_action_observation_mask = (
+        np.zeros(cand_shape_3d, dtype=np.bool_) if action_observation_mask is not None else None
+    )
+    candidate_continuous_action_observation_mask = (
+        np.zeros(cand_shape_3d_continuous, dtype=np.bool_)
+        if continuous_action_observation_mask is not None
+        else None
     )
     candidate_promoted_ids = np.zeros(cand_shape_2d, dtype=promoted_ids.dtype)
     candidate_line_item_objective = np.zeros(cand_shape_2d, dtype=np.int16)
@@ -638,6 +677,15 @@ def from_record_batch(
             history_safety_label_mask[*hslice] = safety_label_mask[*dslice]
             history_actions[*hslice, :] = actions[*dslice, :]
             history_continuous_actions[*hslice, :] = continuous_actions[*dslice, :]
+            if history_action_observation_mask is not None and action_observation_mask is not None:
+                history_action_observation_mask[*hslice, :] = action_observation_mask[*dslice, :]
+            if (
+                history_continuous_action_observation_mask is not None
+                and continuous_action_observation_mask is not None
+            ):
+                history_continuous_action_observation_mask[*hslice, :] = (
+                    continuous_action_observation_mask[*dslice, :]
+                )
 
             src_indices = user_history_indices[-num_history:]
             _stack_features(
@@ -722,6 +770,18 @@ def from_record_batch(
             candidate_post_creation_ts_sec[*cslice] = post_creation_ts_sec[*dslice]
             candidate_actions[*cslice] = actions[*dslice, :]
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
+            if (
+                candidate_action_observation_mask is not None
+                and action_observation_mask is not None
+            ):
+                candidate_action_observation_mask[*cslice] = action_observation_mask[*dslice, :]
+            if (
+                candidate_continuous_action_observation_mask is not None
+                and continuous_action_observation_mask is not None
+            ):
+                candidate_continuous_action_observation_mask[*cslice] = (
+                    continuous_action_observation_mask[*dslice, :]
+                )
             candidate_promoted_ids[*cslice] = promoted_ids[*dslice]
             candidate_line_item_objective[*cslice] = line_item_objective[*dslice]
             candidate_safety_label_mask[*cslice] = safety_label_mask[*dslice]
@@ -807,6 +867,10 @@ def from_record_batch(
             candidate_post_creation_ts_sec[not_found] = 0
             candidate_actions[not_found] = 0
             candidate_continuous_actions[not_found] = 0
+            if candidate_action_observation_mask is not None:
+                candidate_action_observation_mask[not_found] = 0
+            if candidate_continuous_action_observation_mask is not None:
+                candidate_continuous_action_observation_mask[not_found] = 0
             candidate_promoted_ids[not_found] = 0
             candidate_line_item_objective[not_found] = 0
             candidate_safety_label_mask[not_found] = 0
@@ -854,6 +918,12 @@ def from_record_batch(
         post_creation_ts_sec=history_post_creation_ts_sec,
         post_sids=history_post_sids,
     )
+    if history_action_observation_mask is not None:
+        history_seq["action_observation_mask"] = history_action_observation_mask
+    if history_continuous_action_observation_mask is not None:
+        history_seq["continuous_action_observation_mask"] = (
+            history_continuous_action_observation_mask
+        )
     candidate_seq = PostSeq(
         impr_ts=candidate_impr_ts,
         actions=candidate_actions,
@@ -876,6 +946,12 @@ def from_record_batch(
         post_creation_ts_sec=candidate_post_creation_ts_sec,
         post_sids=candidate_post_sids,
     )
+    if candidate_action_observation_mask is not None:
+        candidate_seq["action_observation_mask"] = candidate_action_observation_mask
+    if candidate_continuous_action_observation_mask is not None:
+        candidate_seq["continuous_action_observation_mask"] = (
+            candidate_continuous_action_observation_mask
+        )
 
     candidate_seq_with_negatives = apply_negative_sampling(
         user_ids,
@@ -950,6 +1026,10 @@ def apply_negative_sampling(
     client_app_id = post_seq["client_app_id"]
     post_creation_ts_sec = post_seq["post_creation_ts_sec"]
     continuous_actions = post_seq["continuous_actions"]
+    action_observation_mask = post_seq.get("action_observation_mask")
+    continuous_action_observation_mask = post_seq.get(
+        "continuous_action_observation_mask"
+    )
     promoted_ids = post_seq["promoted_ids"]
     line_item_objective = post_seq["line_item_objective"]
     safety_label_mask = post_seq["safety_label_mask"]
@@ -985,6 +1065,18 @@ def apply_negative_sampling(
     num_continuous_actions = continuous_actions.shape[2]
     new_continuous_actions = np.zeros(
         (batch_size, total_candidate_slots, num_continuous_actions), dtype=np.float32
+    )
+    new_action_observation_mask = (
+        np.zeros((batch_size, total_candidate_slots, actions.shape[2]), dtype=np.bool_)
+        if action_observation_mask is not None
+        else None
+    )
+    new_continuous_action_observation_mask = (
+        np.zeros(
+            (batch_size, total_candidate_slots, num_continuous_actions), dtype=np.bool_
+        )
+        if continuous_action_observation_mask is not None
+        else None
     )
     new_post_hashes = np.zeros(
         (batch_size, total_candidate_slots, post_hashes.shape[2]), dtype=post_hashes.dtype
@@ -1031,6 +1123,15 @@ def apply_negative_sampling(
     if new_post_sids is not None and _post_sids is not None:
         new_post_sids[:, positive_slice, :] = _post_sids
     new_continuous_actions[:, positive_slice, :] = continuous_actions
+    if new_action_observation_mask is not None and action_observation_mask is not None:
+        new_action_observation_mask[:, positive_slice, :] = action_observation_mask
+    if (
+        new_continuous_action_observation_mask is not None
+        and continuous_action_observation_mask is not None
+    ):
+        new_continuous_action_observation_mask[:, positive_slice, :] = (
+            continuous_action_observation_mask
+        )
     if categorical_features.shape[2] > 0:
         new_categorical_features[:, positive_slice, :] = categorical_features
     if bool_features.shape[2] > 0:
@@ -1117,6 +1218,17 @@ def apply_negative_sampling(
         new_actions[
             curr_user_idx, start_slot:end_slot, action_type_map["ClientTweetRecapNotDwelled"]
         ] = 1
+        if new_action_observation_mask is not None and action_observation_mask is not None:
+            new_action_observation_mask[curr_user_idx, start_slot:end_slot, :] = (
+                action_observation_mask[post_src]
+            )
+        if (
+            new_continuous_action_observation_mask is not None
+            and continuous_action_observation_mask is not None
+        ):
+            new_continuous_action_observation_mask[curr_user_idx, start_slot:end_slot, :] = (
+                continuous_action_observation_mask[post_src]
+            )
         if post_ids is not None and new_post_ids is not None:
             new_post_ids[curr_user_idx, start_slot:end_slot] = post_ids[post_src]
         if promoted_ids is not None and new_promoted_ids is not None:
@@ -1184,7 +1296,7 @@ def apply_negative_sampling(
                 curr_user_idx, start_slot, end_slot, post_src=curr_user_idx, query_src=neg_user_idx
             )
 
-    return PostSeq(
+    result = PostSeq(
         impr_ts=new_impr_ts,
         actions=new_actions,
         post_hashes=new_post_hashes,
@@ -1206,6 +1318,13 @@ def apply_negative_sampling(
         post_creation_ts_sec=new_post_creation_ts_sec,
         post_sids=new_post_sids,
     )
+    if new_action_observation_mask is not None:
+        result["action_observation_mask"] = new_action_observation_mask
+    if new_continuous_action_observation_mask is not None:
+        result["continuous_action_observation_mask"] = (
+            new_continuous_action_observation_mask
+        )
+    return result
 
 
 def apply_global_negative_sampling(
@@ -1223,6 +1342,10 @@ def apply_global_negative_sampling(
     impr_ts = post_seq["impr_ts"]
     actions = post_seq["actions"]
     continuous_actions = post_seq["continuous_actions"]
+    action_observation_mask = post_seq.get("action_observation_mask")
+    continuous_action_observation_mask = post_seq.get(
+        "continuous_action_observation_mask"
+    )
     post_hashes = post_seq["post_hashes"]
     auth_hashes = post_seq["auth_hashes"]
     ip_hashes = post_seq["ip_hashes"]
@@ -1273,6 +1396,18 @@ def apply_global_negative_sampling(
         (batch_size, expanded_candidate_slots, num_continuous_actions),
         dtype=continuous_actions.dtype,
     )
+    new_action_observation_mask = (
+        np.zeros((batch_size, expanded_candidate_slots, actions.shape[2]), dtype=np.bool_)
+        if actions is not None and action_observation_mask is not None
+        else None
+    )
+    new_continuous_action_observation_mask = (
+        np.zeros(
+            (batch_size, expanded_candidate_slots, num_continuous_actions), dtype=np.bool_
+        )
+        if continuous_action_observation_mask is not None
+        else None
+    )
 
     new_categorical_features = np.zeros(
         (batch_size, expanded_candidate_slots, categorical_features.shape[2]),
@@ -1299,6 +1434,19 @@ def apply_global_negative_sampling(
     new_client_app_id[:, original_slice] = client_app_id
     new_post_creation_ts_sec[:, original_slice] = post_creation_ts_sec
     new_continuous_actions[:, original_slice, :] = continuous_actions
+    if new_action_observation_mask is not None and action_observation_mask is not None:
+        new_action_observation_mask[:, original_slice, :] = action_observation_mask
+        new_action_observation_mask[:, expanded_slice, :] = action_observation_mask[:, 0:1, :]
+    if (
+        new_continuous_action_observation_mask is not None
+        and continuous_action_observation_mask is not None
+    ):
+        new_continuous_action_observation_mask[:, original_slice, :] = (
+            continuous_action_observation_mask
+        )
+        new_continuous_action_observation_mask[:, expanded_slice, :] = (
+            continuous_action_observation_mask[:, 0:1, :]
+        )
     if categorical_features.shape[2] > 0:
         new_categorical_features[:, original_slice, :] = categorical_features
     if bool_features.shape[2] > 0:
@@ -1411,7 +1559,7 @@ def apply_global_negative_sampling(
 
     new_product_surface[:, expanded_slice] = product_surface[:, 0:1]
 
-    return PostSeq(
+    result = PostSeq(
         impr_ts=new_impr_ts,
         actions=new_actions,
         post_hashes=new_post_hashes,
@@ -1433,6 +1581,13 @@ def apply_global_negative_sampling(
         post_creation_ts_sec=new_post_creation_ts_sec,
         post_sids=new_gn_post_sids,
     )
+    if new_action_observation_mask is not None:
+        result["action_observation_mask"] = new_action_observation_mask
+    if new_continuous_action_observation_mask is not None:
+        result["continuous_action_observation_mask"] = (
+            new_continuous_action_observation_mask
+        )
+    return result
 
 
 _TZ_ENUM_TO_UTC_OFFSET: np.ndarray = np.array(
