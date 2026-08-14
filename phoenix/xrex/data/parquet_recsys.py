@@ -37,6 +37,10 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
+from xrex.data.recsys.observation_sidecars import (
+    ObservationMaskSidecar,
+    load_observation_mask_sidecar,
+)
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
     NUM_USER_INSTALLED_APPS,
@@ -141,6 +145,8 @@ class LazyRecordBatchIterator:
         fname: str,
         conversion_delay_columns: list[str] | None = None,
         include_action_delay_columns: bool = False,
+        require_label_observation_masks: bool = False,
+        observation_sidecar_root: str | None = None,
     ):
         self.pf: pq.ParquetFile = pf
         self.iter: Iterator[pa.RecordBatch] | None = None
@@ -150,10 +156,14 @@ class LazyRecordBatchIterator:
         self.fname: str = fname
         self.conversion_delay_columns: list[str] | None = conversion_delay_columns
         self.include_action_delay_columns: bool = include_action_delay_columns
+        self.require_label_observation_masks: bool = require_label_observation_masks
+        self.observation_sidecar_root: str | None = observation_sidecar_root
         self._sidecar_delays: dict[str, np.ndarray] | None = None
+        self._observation_sidecar: ObservationMaskSidecar | None = None
         self._row_pos: int = 0
 
     def seek(self):
+        self._row_pos = 0
         arrow_schema = self.pf.schema_arrow
         excluded_columns = ["firstPageSeq"]
         valid_columns = [name for name in arrow_schema.names if name not in excluded_columns]
@@ -172,6 +182,18 @@ class LazyRecordBatchIterator:
                         f"sidecar {sidecar} column {name} has {mat.shape[0]} rows, "
                         f"batch file has {self.num_rows}"
                     )
+
+        if self.require_label_observation_masks:
+            if self.observation_sidecar_root is None:
+                raise ValueError(
+                    "require_label_observation_masks=True requires an observation sidecar root"
+                )
+            self._observation_sidecar = load_observation_mask_sidecar(
+                base_path=self.fname,
+                dataset_root=self.observation_sidecar_root,
+                parquet_num_rows=self.num_rows,
+                parquet_num_columns=len(arrow_schema),
+            )
 
         cnt = 0
         while cnt < self.rows_to_skip:
@@ -194,6 +216,8 @@ class LazyRecordBatchIterator:
                 for name, mat in self._sidecar_delays.items()
             }
             batch = conversion_labels.attach_delays(batch, window)
+        if self._observation_sidecar is not None:
+            batch = self._observation_sidecar.attach(batch, self._row_pos)
         self._row_pos += batch.num_rows
         return batch
 
@@ -262,9 +286,13 @@ class InterleavingRecordBatchProvider:
         max_timestamp_ms: int | None = None,
         conversion_delay_columns: list[str] | None = None,
         include_action_delay_columns: bool = False,
+        require_label_observation_masks: bool = False,
+        observation_sidecar_root: str | None = None,
     ):
         self._conversion_delay_columns = conversion_delay_columns
         self._include_action_delay_columns = include_action_delay_columns
+        self._require_label_observation_masks = require_label_observation_masks
+        self._observation_sidecar_root = observation_sidecar_root
         if metadata_path is None and index_path is None:
             raise ValueError("Either metadata_path or index_path must be provided")
 
@@ -497,6 +525,8 @@ class InterleavingRecordBatchProvider:
                     path,
                     self._conversion_delay_columns,
                     self._include_action_delay_columns,
+                    self._require_label_observation_masks,
+                    self._observation_sidecar_root,
                 )
             except Exception as e:
                 if "No such file or directory" in str(e):
@@ -659,24 +689,28 @@ class InterleavingRecordBatchProvider:
                 ) -> tuple[LazyRecordBatchIterator | None, pa.RecordBatch | None]:
                     try:
                         pf = pq.ParquetFile(file_path)
-                        holder = LazyRecordBatchIterator(
-                            pf,
-                            self._batch_size,
-                            file_path,
-                            self._conversion_delay_columns,
-                            self._include_action_delay_columns,
-                        )
-                        batch = holder.read()
-                        return holder, batch
-                    except StopIteration:
-                        return holder, None
                     except Exception as e:
                         if "No such file" in str(e):
                             return None, None
                         raise
+                    holder = LazyRecordBatchIterator(
+                        pf,
+                        self._batch_size,
+                        file_path,
+                        self._conversion_delay_columns,
+                        self._include_action_delay_columns,
+                        self._require_label_observation_masks,
+                        self._observation_sidecar_root,
+                    )
+                    try:
+                        batch = holder.read()
+                        return holder, batch
+                    except StopIteration:
+                        return holder, None
 
                 for f in next_files[: self._interleave_k]:
-                    _prefetch_futures.append(pool.submit(_open_and_read_first, f))
+                    path = _resolve_file_path(self._path, f)
+                    _prefetch_futures.append(pool.submit(_open_and_read_first, path))
 
             def _collect_prefetch() -> tuple[deque, list]:
                 nonlocal _prefetch_futures
@@ -767,7 +801,7 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         )
 
     def pad_post_seq(post_seq: PostSeq) -> PostSeq:
-        return PostSeq(
+        result = PostSeq(
             impr_ts=pad_array(post_seq["impr_ts"]) if post_seq["impr_ts"] is not None else None,
             actions=pad_array(post_seq["actions"]) if post_seq["actions"] is not None else None,
             continuous_actions=pad_array(post_seq["continuous_actions"]),
@@ -801,6 +835,13 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
             if (_psid := post_seq.get("post_sids")) is not None
             else None,
         )
+        if (action_mask := post_seq.get("action_observation_mask")) is not None:
+            result["action_observation_mask"] = pad_array(action_mask)
+        if (
+            continuous_mask := post_seq.get("continuous_action_observation_mask")
+        ) is not None:
+            result["continuous_action_observation_mask"] = pad_array(continuous_mask)
+        return result
 
     padded: RecsysFeaturesBatch = {
         "user_hashes": pad_array(batch_unpadded["user_hashes"]),
@@ -876,6 +917,11 @@ class PhoenixDataset(Dataset):
     conversion_label_types: tuple[str, ...] = ()
     fold_conversion_actions_into_multihot: bool = True
     emit_conversion_label_keys: bool = False
+
+    # Grassy's exact 36-column artifacts carry label availability in immutable
+    # adjacent sidecars.  This stays false for released X datasets; enabling it
+    # makes missing or invalid sidecars fatal before any row reaches training.
+    require_label_observation_masks: bool = False
 
     @property
     def multimodal_embedding_dim(self) -> int:
@@ -1070,6 +1116,8 @@ class PhoenixDataset(Dataset):
                         conversion_delay_columns=conversion_delay_columns,
                         include_action_delay_columns=self.use_conversion_labels
                         and self.fold_conversion_actions_into_multihot,
+                        require_label_observation_masks=self.require_label_observation_masks,
+                        observation_sidecar_root=topic_dir,
                     )
                 else:
                     if resume_position is not None:
@@ -1091,6 +1139,8 @@ class PhoenixDataset(Dataset):
                         conversion_delay_columns=conversion_delay_columns,
                         include_action_delay_columns=self.use_conversion_labels
                         and self.fold_conversion_actions_into_multihot,
+                        require_label_observation_masks=self.require_label_observation_masks,
+                        observation_sidecar_root=topic_dir,
                     )
                 self._rb_provider = rb_provider
                 data_iter = self._rb_provider.get_record_batches()

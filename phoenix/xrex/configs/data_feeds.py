@@ -186,12 +186,15 @@ def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_level
         input_vocab_size=mparams["input_vocab_size"],
         num_continuous_actions=mparams["num_continuous_actions"],
         num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
-        num_kafka_partitions=1024,
+        num_kafka_partitions=mparams.get("num_kafka_partitions", 1024),
         output_vocab_size=mparams["output_vocab_size"],
         multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
+        require_label_observation_masks=mparams.get(
+            "require_label_observation_masks", False
+        ),
     )
 
 

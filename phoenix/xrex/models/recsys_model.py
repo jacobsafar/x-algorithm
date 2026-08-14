@@ -26,6 +26,11 @@ from xrex.data.recsys.constants import (
     engagement_to_ids,
 )
 from xrex.data.recsys.feature_config import ENGAGEMENT_COUNT_BUCKET_MAP, CategoricalFeature
+from xrex.data.recsys.observability import (
+    GRASSY_CONTINUOUS_PADDING_HEADS,
+    GRASSY_DISCRETE_PADDING_HEADS,
+    validate_observation_mask_array,
+)
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch
 from xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
@@ -416,6 +421,19 @@ def get_probs_and_labels(
     return prob_labels
 
 
+def get_engagement_observation_masks(
+    action_observation_mask: jax.Array,
+    metric_group: str = "default",
+) -> dict[str, jax.Array]:
+    """Require every constituent action head before scoring an aggregate metric."""
+
+    masks = {}
+    for eng_name, client_event_list in engagement_to_ids(metric_group).items():
+        id_array = jnp.array(client_event_list)
+        masks[eng_name] = jnp.all(action_observation_mask[..., id_array], axis=-1)
+    return masks
+
+
 def metrics_calc(
     p_list: list[jax.Array],
     y_list: list[jax.Array],
@@ -423,11 +441,23 @@ def metrics_calc(
     mask_keys: list[str],
     mask_values: list[jax.Array],
     stats: dict,
+    engagement_observation_masks: list[jax.Array] | None = None,
 ):
     auc_thresholds = jnp.geomspace(_INITIAL_AUC_THRESHOLD, 1.0, num=_NUM_AUC_THRESHOLDS)
-    res = jax.vmap(engagement_metrics, in_axes=(0, 0, None, None))(
-        jnp.stack(p_list), jnp.stack(y_list), jnp.stack(mask_values), auc_thresholds
-    )
+    if engagement_observation_masks is None:
+        res = jax.vmap(engagement_metrics, in_axes=(0, 0, None, None))(
+            jnp.stack(p_list), jnp.stack(y_list), jnp.stack(mask_values), auc_thresholds
+        )
+    else:
+        per_engagement_masks = jnp.stack(
+            [
+                jnp.stack(mask_values) * observation_mask[None, ...]
+                for observation_mask in engagement_observation_masks
+            ]
+        )
+        res = jax.vmap(engagement_metrics, in_axes=(0, 0, 0, None))(
+            jnp.stack(p_list), jnp.stack(y_list), per_engagement_masks, auc_thresholds
+        )
     stats.update(
         {
             f"{eng_name}_{mask_key}_{name}": res[i][j][k]
@@ -465,6 +495,10 @@ class RecsysAggregatedModelConfig(Config):
 
     continuous_metrics_mae_mean: bool = False
     act_l2_weight: float = 0.0
+
+    # Legacy X batches omit observability masks and retain all-heads-observed
+    # semantics. Grassy training must enable this fail-closed gate.
+    require_label_observation_masks: bool = False
 
     num_continuous_actions: int = 8
 
@@ -1219,6 +1253,46 @@ def cast_jax(arr: npt.NDArray) -> jax.Array:
     return typing.cast(jax.Array, arr)
 
 
+def prepare_observation_mask(
+    raw_mask: npt.NDArray | jax.Array | None,
+    expected_shape: tuple[int, ...],
+    name: str,
+    reserved_heads: tuple[int, ...],
+) -> jax.Array | None:
+    """Validate, cast, and defensively disable Grassy's reserved heads."""
+
+    if raw_mask is None:
+        return None
+    validate_observation_mask_array(raw_mask, expected_shape, name)
+    mask = jnp.asarray(raw_mask, dtype=jnp.bool_)
+    applicable = [head for head in reserved_heads if head < expected_shape[-1]]
+    if applicable:
+        mask = mask.at[..., jnp.array(applicable)].set(False)
+    return mask
+
+
+def pad_observation_mask(
+    mask: jax.Array | None,
+    target_sequence_length: int,
+    name: str,
+) -> jax.Array | None:
+    if mask is None:
+        return None
+    pad_length = target_sequence_length - mask.shape[1]
+    if pad_length < 0:
+        raise ValueError(
+            f"{name} sequence size {mask.shape[1]} exceeds padded target size "
+            f"{target_sequence_length}"
+        )
+    if pad_length == 0:
+        return mask
+    padding = jnp.zeros(
+        (mask.shape[0], pad_length, mask.shape[2]),
+        dtype=jnp.bool_,
+    )
+    return jnp.concatenate([mask, padding], axis=1)
+
+
 def build_metric_masks(
     mask: jax.Array,
     raw_targets: jax.Array,
@@ -1342,8 +1416,17 @@ class RecsysAggregatedModel(hk.Module):
         smoothing_windows: tuple[int, ...] | None = None,
         calib_ema: dict[str, jax.Array] | None = None,
         raw_weights: jax.Array | None = None,
+        action_observation_mask: jax.Array | None = None,
     ) -> dict:
         prob_labels = get_probs_and_labels(logits, raw_targets, self.config.metric_group)
+        engagement_observation_by_name = (
+            get_engagement_observation_masks(
+                action_observation_mask,
+                self.config.metric_group,
+            )
+            if action_observation_mask is not None
+            else None
+        )
 
         eng_names = []
         p_list = []
@@ -1357,12 +1440,30 @@ class RecsysAggregatedModel(hk.Module):
         if raw_weights is not None:
             mask_values = [m * raw_weights for m in mask_values]
 
-        metrics_calc(p_list, y_list, eng_names, mask_keys, mask_values, stats)
+        metrics_calc(
+            p_list,
+            y_list,
+            eng_names,
+            mask_keys,
+            mask_values,
+            stats,
+            (
+                [engagement_observation_by_name[name] for name in eng_names]
+                if engagement_observation_by_name is not None
+                else None
+            ),
+        )
 
         metrics_calc_global_num_tokens(masks, stats)
 
         for mask_key, mval in zip(mask_keys, mask_values):
             stats[f"{mask_key}_effective_num_tokens"] = mval.sum()
+        if engagement_observation_by_name is not None:
+            for eng_name, observation_mask in engagement_observation_by_name.items():
+                for mask_key, mask_value in zip(mask_keys, mask_values):
+                    stats[f"{eng_name}_{mask_key}_effective_num_tokens"] = jnp.sum(
+                        mask_value * observation_mask
+                    )
 
         if rce_ema is not None and rce_alpha is not None and smoothing_windows is not None:
             _eps = 1e-7
@@ -1374,8 +1475,11 @@ class RecsysAggregatedModel(hk.Module):
                     base_key = f"{eng_name}/{mask_key}"
 
                     total_count = stats.get(
-                        f"{mask_key}_effective_num_tokens",
-                        stats[f"{mask_key}_num_tokens"],
+                        f"{eng_name}_{mask_key}_effective_num_tokens",
+                        stats.get(
+                            f"{mask_key}_effective_num_tokens",
+                            stats[f"{mask_key}_num_tokens"],
+                        ),
                     )
                     ce_sum = stats[f"{eng_name}_{mask_key}_loss"] * total_count
                     pos_sum = stats[f"{eng_name}_{mask_key}_num_tokens"]
@@ -1412,6 +1516,9 @@ class RecsysAggregatedModel(hk.Module):
                 for mask_key, mask_val in zip(mask_keys, mask_values):
                     base_key = f"{eng_name}/{mask_key}"
 
+                    if engagement_observation_by_name is not None:
+                        mask_val = mask_val * engagement_observation_by_name[eng_name]
+
                     pred_sum = jnp.sum(p * mask_val)
                     pos_sum_batch = jnp.sum(y * mask_val)
                     batch_stat = jnp.stack([pred_sum, pos_sum_batch])
@@ -1444,8 +1551,17 @@ class RecsysAggregatedModel(hk.Module):
         packed_candidate_seq_len: int,
         stats: dict,
         raw_weights: jax.Array | None = None,
+        action_observation_mask: jax.Array | None = None,
     ) -> dict:
         prob_labels = get_probs_and_labels(logits, raw_targets, self.config.metric_group)
+        engagement_observation_by_name = (
+            get_engagement_observation_masks(
+                action_observation_mask,
+                self.config.metric_group,
+            )
+            if action_observation_mask is not None
+            else None
+        )
 
         len_per_candidate = jnp.repeat(history_len, packed_candidate_seq_len, axis=1)
 
@@ -1460,6 +1576,11 @@ class RecsysAggregatedModel(hk.Module):
             for bucket_name, lo, hi in buckets:
                 bucket_mask = mask & (len_per_candidate >= lo) & (len_per_candidate <= hi)
                 bucket_mask_f = bucket_mask.astype(jnp.float32)
+
+                if engagement_observation_by_name is not None:
+                    bucket_mask_f = (
+                        bucket_mask_f * engagement_observation_by_name[eng_name]
+                    )
 
                 if raw_weights is not None:
                     bucket_mask_f = bucket_mask_f * raw_weights
@@ -1481,6 +1602,8 @@ class RecsysAggregatedModel(hk.Module):
                 )
 
                 stats[f"{bucket_name}_num_tokens"] = total
+                if engagement_observation_by_name is not None:
+                    stats[f"{eng_name}_{bucket_name}_effective_num_tokens"] = total
 
         return stats
 
@@ -1528,6 +1651,7 @@ class RecsysAggregatedModel(hk.Module):
         smoothing_windows: tuple[int, ...] | None = None,
         calib_ema: dict[str, jax.Array] | None = None,
         raw_weights: jax.Array | None = None,
+        action_observation_mask: jax.Array | None = None,
     ) -> dict:
         if stats is None:
             stats = {}
@@ -1554,6 +1678,7 @@ class RecsysAggregatedModel(hk.Module):
             smoothing_windows=smoothing_windows,
             calib_ema=calib_ema,
             raw_weights=raw_weights,
+            action_observation_mask=action_observation_mask,
         )
 
     def compute_timestamp_metrics(
@@ -2576,15 +2701,52 @@ class RecsysAggregatedModel(hk.Module):
         product_surface = batch["candidate_seq"]["product_surface"]
         promoted_ids = batch["candidate_seq"]["promoted_ids"]
         candidate_continuous_actions = batch["candidate_seq"]["continuous_actions"]
+        raw_action_observation_mask = batch["candidate_seq"].get("action_observation_mask")
+        raw_continuous_action_observation_mask = batch["candidate_seq"].get(
+            "continuous_action_observation_mask"
+        )
+        if self.config.require_label_observation_masks:
+            missing_masks = [
+                name
+                for name, value in (
+                    ("candidate_seq.action_observation_mask", raw_action_observation_mask),
+                    (
+                        "candidate_seq.continuous_action_observation_mask",
+                        raw_continuous_action_observation_mask,
+                    ),
+                )
+                if value is None
+            ]
+            if missing_masks:
+                raise ValueError(
+                    "require_label_observation_masks=True but batch is missing "
+                    + ", ".join(missing_masks)
+                )
         raw_client_app_id = batch["candidate_seq"].get("client_app_id")
         raw_line_item_objective = batch["candidate_seq"].get("line_item_objective")
         candidate_safety_mask = batch["candidate_seq"].get("safety_label_mask")
         assert targets is not None
         targets = cast_jax(targets)
+        action_observation_mask = prepare_observation_mask(
+            raw_action_observation_mask,
+            tuple(targets.shape),
+            "candidate_seq.action_observation_mask",
+            GRASSY_DISCRETE_PADDING_HEADS,
+        )
         product_surface = cast_jax(product_surface)
         promoted_ids = cast_jax(promoted_ids) if promoted_ids is not None else None
         candidate_continuous_actions = (
             cast_jax(candidate_continuous_actions)
+            if candidate_continuous_actions is not None
+            else None
+        )
+        continuous_action_observation_mask = (
+            prepare_observation_mask(
+                raw_continuous_action_observation_mask,
+                tuple(candidate_continuous_actions.shape),
+                "candidate_seq.continuous_action_observation_mask",
+                GRASSY_CONTINUOUS_PADDING_HEADS,
+            )
             if candidate_continuous_actions is not None
             else None
         )
@@ -2721,6 +2883,16 @@ class RecsysAggregatedModel(hk.Module):
                 line_item_objective,
                 candidate_safety_mask,
             )
+            action_observation_mask = pad_observation_mask(
+                action_observation_mask,
+                targets.shape[1],
+                "candidate_seq.action_observation_mask",
+            )
+            continuous_action_observation_mask = pad_observation_mask(
+                continuous_action_observation_mask,
+                targets.shape[1],
+                "candidate_seq.continuous_action_observation_mask",
+            )
 
             idx = jnp.arange(padding_mask.shape[1], dtype=jnp.int32)[None, :]
             segment_ids = jnp.broadcast_to(
@@ -2814,6 +2986,8 @@ class RecsysAggregatedModel(hk.Module):
 
         num_actions = targets.shape[-1]
         loss_mask = jnp.ones((*target_padding_mask.shape, num_actions))
+        if action_observation_mask is not None:
+            loss_mask = loss_mask * action_observation_mask.astype(loss_mask.dtype)
 
         if self.config.mask_neg_feedback_on_negatives:
             neg_head_mask = (
@@ -2883,6 +3057,7 @@ class RecsysAggregatedModel(hk.Module):
             smoothing_windows=smoothing_windows,
             calib_ema=calib_ema,
             raw_weights=raw_weights,
+            action_observation_mask=action_observation_mask,
         )
         stats = self.compute_timestamp_metrics(batch=batch, stats=stats)
         stats = self.compute_sid_metrics(batch=batch, stats=stats)
@@ -2898,6 +3073,7 @@ class RecsysAggregatedModel(hk.Module):
                 packed_candidate_seq_len=packed_candidate_seq_len,
                 stats=stats,
                 raw_weights=raw_weights,
+                action_observation_mask=action_observation_mask,
             )
 
         continuous_action_loss_total = jnp.array(0.0)
@@ -2919,6 +3095,10 @@ class RecsysAggregatedModel(hk.Module):
                     pred_raw = candidate_continuous_preds[:, :, loss_config.action_index]
 
                     head_valid_mask = target_padding_mask
+                    if continuous_action_observation_mask is not None:
+                        head_valid_mask = head_valid_mask * continuous_action_observation_mask[
+                            :, :, loss_config.action_index
+                        ].astype(head_valid_mask.dtype)
                     if loss_config.product_surfaces or loss_config.exclude_product_surfaces:
                         head_surface_mask = _get_surface_mask(loss_config, product_surface)
                         head_valid_mask = head_valid_mask * head_surface_mask.astype(
@@ -2964,6 +3144,13 @@ class RecsysAggregatedModel(hk.Module):
                     assert loss_config.metric_name is not None
                     for mask_suffix, variant_mask in continuous_masks.items():
                         head_variant_mask = variant_mask
+                        if continuous_action_observation_mask is not None:
+                            head_variant_mask = (
+                                head_variant_mask
+                                * continuous_action_observation_mask[
+                                    :, :, loss_config.action_index
+                                ].astype(head_variant_mask.dtype)
+                            )
                         if loss_config.product_surfaces or loss_config.exclude_product_surfaces:
                             head_variant_mask = head_variant_mask * head_surface_mask.astype(
                                 head_variant_mask.dtype
