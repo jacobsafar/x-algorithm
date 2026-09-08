@@ -48,7 +48,7 @@ pub enum KeyError {
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
-pub struct Key(Vec<u8>);
+pub struct Key(Box<str>);
 
 impl Key {
     pub fn new(bytes: Vec<u8>) -> std::result::Result<Self, KeyError> {
@@ -58,29 +58,24 @@ impl Key {
         if bytes.iter().any(|&b| matches!(b, b' ' | b'\n' | b'\r')) {
             return Err(KeyError::Whitespace);
         }
-        std::str::from_utf8(&bytes).map_err(|_| KeyError::InvalidUtf8)?;
-        Ok(Key(bytes))
-    }
-
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Key(bytes)
+        let s = String::from_utf8(bytes).map_err(|_| KeyError::InvalidUtf8)?;
+        Ok(Key(s.into_boxed_str()))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.0.as_bytes()
     }
 }
 
 impl AsRef<[u8]> for Key {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        self.0.as_bytes()
     }
 }
 
 impl std::fmt::Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = std::str::from_utf8(self.as_bytes()).expect("Key::new validates UTF-8");
-        f.write_str(s)
+        f.write_str(&self.0)
     }
 }
 

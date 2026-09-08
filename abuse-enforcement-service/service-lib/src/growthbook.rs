@@ -32,6 +32,11 @@ const DEFAULT_DEDUP_HEAD_ACTION_CLASS: &[(&str, u8)] = &[
     ),
 ];
 
+const GENERIC_ACTIONS_KEY: &str = "generic_actions";
+const GENERIC_KINDS_KEY: &str = "kinds";
+const GENERIC_SUSPEND_POLICIES_KEY: &str = "suspend_policies";
+const GENERIC_LABELS_KEY: &str = "labels";
+
 const KAFKA_KEY: &str = "kafka";
 const CONSUMER_KEY: &str = "consumer";
 const PRODUCER_KEY: &str = "producer";
@@ -187,6 +192,13 @@ impl DynamicConfig {
         dedup_action_class_from_config(self.config().as_ref(), head)
     }
 
+    pub fn generic_action_allowlist(
+        &self,
+        entity_type: EntityType,
+    ) -> crate::generic_actions::GenericActionAllowlist {
+        generic_actions_from_config(self.config().as_ref(), entity_type)
+    }
+
     pub fn config(&self) -> Option<Value> {
         let c = self.client.as_ref()?;
         Some(c.feature_result(GROWTHBOOK_CONFIG_KEY, None).value)
@@ -224,6 +236,30 @@ fn parse_bool(config: Option<&Value>, key: &str, default: bool) -> bool {
     config
         .and_then(|cfg| cfg.get(key)?.as_bool())
         .unwrap_or(default)
+}
+
+fn string_set(v: Option<&Value>) -> std::collections::HashSet<String> {
+    v.and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn generic_actions_from_config(
+    config: Option<&Value>,
+    entity_type: EntityType,
+) -> crate::generic_actions::GenericActionAllowlist {
+    let entity = get_path(config, &[GENERIC_ACTIONS_KEY, entity_type.as_str()]);
+    crate::generic_actions::GenericActionAllowlist {
+        kinds: string_set(entity.and_then(|e| e.get(GENERIC_KINDS_KEY))),
+        suspend_policies: string_set(entity.and_then(|e| e.get(GENERIC_SUSPEND_POLICIES_KEY))),
+        labels: string_set(entity.and_then(|e| e.get(GENERIC_LABELS_KEY))),
+    }
 }
 
 fn dedup_action_class_from_config(config: Option<&Value>, head: &str) -> u8 {
@@ -415,6 +451,96 @@ mod tests {
 
         let cfg = json!({ "max_post_enforcements_per_day": 42 });
         assert_eq!(pick_u32(Some(&cfg), &[MAX_POST_ENFORCEMENTS_KEY], 7), 42);
+    }
+
+    #[test]
+    fn generic_actions_parses_per_entity_allowlists() {
+        let cfg = json!({"generic_actions": {
+            "user": {
+                "kinds": ["suspend", "label", "bounce_captcha"],
+                "suspend_policies": ["PlatformManipulation"],
+                "labels": ["SpamHighRecall"],
+            },
+            "post": {
+                "kinds": ["post_label", "suspend_author"],
+                "suspend_policies": ["Cse"],
+                "labels": ["SpamHighRecall", "RiskyHighVizReply"],
+            },
+        }});
+        let user = generic_actions_from_config(Some(&cfg), EntityType::User);
+        assert!(user.kinds.contains("suspend"));
+        assert!(user.kinds.contains("bounce_captcha"));
+        assert!(!user.kinds.contains("post_label"), "no cross-entity bleed");
+        assert!(user.suspend_policies.contains("PlatformManipulation"));
+        assert!(!user.suspend_policies.contains("Cse"));
+        assert_eq!(user.labels.len(), 1);
+
+        let post = generic_actions_from_config(Some(&cfg), EntityType::Post);
+        assert!(post.kinds.contains("suspend_author"));
+        assert!(!post.kinds.contains("suspend"));
+        assert!(post.suspend_policies.contains("Cse"));
+        assert!(post.labels.contains("RiskyHighVizReply"));
+    }
+
+    #[test]
+    fn generic_actions_absent_or_partial_config_fails_closed() {
+        let empty = generic_actions_from_config(None, EntityType::User);
+        assert_eq!(
+            empty,
+            crate::generic_actions::GenericActionAllowlist::default()
+        );
+
+        let cfg = json!({"dry_run": true});
+        let a = generic_actions_from_config(Some(&cfg), EntityType::User);
+        assert!(a.kinds.is_empty() && a.suspend_policies.is_empty() && a.labels.is_empty());
+
+        let cfg = json!({"generic_actions": {"post": {"kinds": ["post_label"]}}});
+        let user = generic_actions_from_config(Some(&cfg), EntityType::User);
+        assert!(user.kinds.is_empty());
+        let post = generic_actions_from_config(Some(&cfg), EntityType::Post);
+        assert!(post.kinds.contains("post_label"));
+        assert!(post.suspend_policies.is_empty());
+        assert!(post.labels.is_empty());
+    }
+
+    #[test]
+    fn generic_actions_malformed_values_fail_closed() {
+        let cfg = json!({"generic_actions": {
+            "user": {
+                "kinds": "suspend",
+                "suspend_policies": [1, true, null],
+                "labels": ["SpamHighRecall", 42],
+            },
+        }});
+        let user = generic_actions_from_config(Some(&cfg), EntityType::User);
+        assert!(user.kinds.is_empty());
+        assert!(user.suspend_policies.is_empty());
+        assert_eq!(user.labels.len(), 1);
+        assert!(user.labels.contains("SpamHighRecall"));
+
+        let cfg = json!({"generic_actions": ["suspend"]});
+        let user = generic_actions_from_config(Some(&cfg), EntityType::User);
+        assert_eq!(
+            user,
+            crate::generic_actions::GenericActionAllowlist::default()
+        );
+    }
+
+    #[test]
+    fn generic_actions_empty_string_entries_are_dropped() {
+        let cfg = json!({"generic_actions": {
+            "user": {
+                "kinds": ["suspend", ""],
+                "suspend_policies": ["", "  ", "PlatformManipulation"],
+                "labels": ["\t", "SpamHighRecall"],
+            },
+        }});
+        let user = generic_actions_from_config(Some(&cfg), EntityType::User);
+        assert_eq!(user.kinds.len(), 1);
+        assert_eq!(user.suspend_policies.len(), 1);
+        assert!(user.suspend_policies.contains("PlatformManipulation"));
+        assert_eq!(user.labels.len(), 1);
+        assert!(user.labels.contains("SpamHighRecall"));
     }
 
     #[test]

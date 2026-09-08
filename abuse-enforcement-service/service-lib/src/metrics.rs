@@ -175,6 +175,14 @@ lazy_static! {
             .unwrap();
 
 
+                                                                                    pub static ref GENERIC_ACTION_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_generic_action_total",
+            "Requested actions handled by the generic executor, by entity_type, kind, result, and fail-closed skip reason.",
+            &["entity_type", "kind", "result", "reason"])
+            .unwrap();
+
+
         pub static ref HTTP_LATENCY: HistogramVec =
         register_histogram_vec!(
             "abuse_enforcement_http_latency_seconds",
@@ -191,7 +199,7 @@ lazy_static! {
             .unwrap();
 
 
-                    pub static ref KAFKA_PUBLISH_TOTAL: IntCounterVec =
+                                pub static ref KAFKA_PUBLISH_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_kafka_publish_total",
             "Records published to a Kafka publish sink, by sink and produce result.",
@@ -258,6 +266,7 @@ pub fn init() {
     let _ = &*MANHATTAN_ERRORS_TOTAL;
     let _ = &*KAFKA_SELF_DELETE_TOTAL;
     let _ = &*RULES_YAML_COMPILED;
+    let _ = &*GENERIC_ACTION_TOTAL;
     let _ = &*HTTP_LATENCY;
     let _ = &*HTTP_INFLIGHT;
     let _ = &*KAFKA_PUBLISH_TOTAL;

@@ -1,4 +1,5 @@
 use super::client_event::ad_client_event_info;
+use crate::models::query::RequestType;
 
 const ENTRY_NAMESPACE_PROMOTED_TWEET: &str = "promoted-tweet";
 use super::post_marshaller::{make_tweet, make_tweet_item};
@@ -25,12 +26,21 @@ const EMPTY_LANDING_URL: &str = "emptyLandingUrl";
 const DSP_IMPRESSION_PREAMBLE: &str = "IS1:";
 const DEFAULT_DSP_CREATIVE_ID: &str = "default-dsp-creative-id";
 
-pub(super) fn marshal_ad(ad: &AdIndexInfo, sort_index: i64) -> TimelineEntry {
+pub(super) fn marshal_ad(
+    ad: &AdIndexInfo,
+    sort_index: i64,
+    request_type: RequestType,
+) -> TimelineEntry {
     let impression_string = format!("{:x}", ad.impression_id);
 
     if ad.post_id == 0 && ad.rtb_ad_metadata.is_some() {
         return marshal_ssp_ad(ad, sort_index, &impression_string);
     }
+
+    let entry_id = format!(
+        "{}-{}-{}",
+        ENTRY_NAMESPACE_PROMOTED_TWEET, ad.post_id, impression_string
+    );
 
     let url_params: BTreeMap<String, String> = ad
         .url_params
@@ -183,11 +193,11 @@ pub(super) fn marshal_ad(ad: &AdIndexInfo, sort_index: i64) -> TimelineEntry {
     tweet.contextual_tweet_ref = Some(contextual_ref(ad.post_id));
 
     TimelineEntry {
-        entry_id: format!("{}-{}", ENTRY_NAMESPACE_PROMOTED_TWEET, ad.post_id),
+        entry_id,
         sort_index,
         content: TimelineEntryContent::Item(make_tweet_item(
             tweet,
-            Some(ad_client_event_info(ad)),
+            Some(ad_client_event_info(ad, request_type)),
             None,
         )),
         expiry_time: None,
@@ -305,7 +315,7 @@ mod tests {
     use xai_urt_thrift::item::TimelineItemContent;
 
     fn promoted_metadata_for(ad: AdIndexInfo) -> PromotedMetadata {
-        let entry = marshal_ad(&ad, 0);
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
         let item = match entry.content {
             TimelineEntryContent::Item(item) => item,
             _ => panic!("expected an item entry"),
@@ -391,7 +401,7 @@ mod tests {
 
     #[test]
     fn ssp_ad_emits_rtb_image_ad_item() {
-        let entry = marshal_ad(&ssp_ad(), 7);
+        let entry = marshal_ad(&ssp_ad(), 7, RequestType::ForYou);
 
         assert_eq!(entry.entry_id, "rtb-image-ad-abc123");
         assert_eq!(entry.sort_index, 7);
@@ -440,8 +450,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let entry = marshal_ad(&ad, 0);
-        assert_eq!(entry.entry_id, "promoted-tweet-42");
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
+        assert_eq!(entry.entry_id, "promoted-tweet-42-0");
         let item = match entry.content {
             TimelineEntryContent::Item(item) => item,
             _ => panic!("expected an item entry"),
@@ -455,7 +465,7 @@ mod tests {
             post_id: 0,
             ..Default::default()
         };
-        let entry = marshal_ad(&ad, 0);
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
         let item = match entry.content {
             TimelineEntryContent::Item(item) => item,
             _ => panic!("expected an item entry"),

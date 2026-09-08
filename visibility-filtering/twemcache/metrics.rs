@@ -41,7 +41,7 @@ enum Sink {
 }
 
 impl Metrics {
-            pub(crate) fn global() -> Self {
+    pub(crate) fn global() -> Self {
         Self(Sink::Global)
     }
 
@@ -65,7 +65,7 @@ impl Metrics {
         }
     }
 
-        pub(crate) fn record_backpressure(&self, count: u64) {
+    pub(crate) fn record_backpressure(&self, count: u64) {
         if count > 0
             && let Some(sr) = self.sink()
         {
@@ -73,7 +73,7 @@ impl Metrics {
         }
     }
 
-        pub(crate) fn observe_pipeline_depth(&self, depth: usize) {
+    pub(crate) fn observe_pipeline_depth(&self, depth: usize) {
         if let Some(sr) = self.sink() {
             sr.observe(
                 PIPELINE_DEPTH,

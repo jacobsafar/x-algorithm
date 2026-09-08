@@ -15,7 +15,7 @@ pub struct SafetyLabelHydrator {
 
 pub struct SafetyLabelHydration {
     pub label_types: HashMap<TweetId, SafetyLabelMap>,
-    pub label_response: HashMap<TweetId, vf_pb::SafetyLabelMap>,
+    pub label_response: HashMap<TweetId, Arc<vf_pb::SafetyLabelMap>>,
 }
 
 impl SafetyLabelHydrator {
@@ -48,7 +48,7 @@ impl SafetyLabelHydrator {
                 Some(label_map) => {
                     label_types
                         .insert(*tweet_id, SafetyLabelMap::from_proto_label_types(label_map));
-                    label_response.insert(*tweet_id, label_map.clone());
+                    label_response.insert(*tweet_id, Arc::clone(label_map));
                 }
                 None => {
                     label_types.insert(*tweet_id, SafetyLabelMap::default());

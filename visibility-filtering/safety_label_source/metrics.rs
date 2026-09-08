@@ -15,6 +15,7 @@ const CACHE_KEYS: &str = "safety_labels_cache_keys";
 const MANHATTAN_KEYS: &str = "safety_labels_manhattan_keys";
 const CACHE_FALLBACK_KEYS: &str = "safety_labels_cache_fallback_keys";
 const BATCH_SIZE: &str = "safety_labels_lookup_batch_size";
+const CACHE_WARM_KEYS: &str = "safety_labels_cache_warm_keys";
 
 #[derive(Clone, Copy)]
 pub(crate) enum RequestOutcome {
@@ -198,6 +199,35 @@ pub(crate) fn record_cache_fallback_keys(
     incr_nonzero(
         CACHE_FALLBACK_KEYS,
         &[("source", source.as_str()), ("reason", reason.as_str())],
+        count as u64,
+    );
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WarmKeyResult {
+    EligibleMiss,
+    Enqueued,
+    DroppedChannelFull,
+    FetchIssued,
+    FetchFailed,
+}
+
+impl WarmKeyResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EligibleMiss => "eligible_miss",
+            Self::Enqueued => "enqueued",
+            Self::DroppedChannelFull => "dropped_channel_full",
+            Self::FetchIssued => "fetch_issued",
+            Self::FetchFailed => "fetch_failed",
+        }
+    }
+}
+
+pub(crate) fn record_cache_warm_keys(result: WarmKeyResult, count: usize) {
+    incr_nonzero(
+        CACHE_WARM_KEYS,
+        &[("result", result.as_str())],
         count as u64,
     );
 }

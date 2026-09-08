@@ -12,7 +12,7 @@ use xai_twittercontext_proto::TwitterContextViewer;
 use xai_visibility_filtering::models::{Action, FilteredReason};
 use xai_visibility_filtering::vf_client::SafetyLevel;
 use xai_visibility_filtering::vf_client::SafetyLevel::{TimelineHome, TimelineHomeRecommendations};
-use xai_visibility_filtering::vf_client::VfClient;
+use xai_visibility_filtering::vf_client::{TweetVisibility, VfClient};
 
 pub struct VFCandidateHydrator {
     pub strato_vf_client: Arc<dyn VfClient + Send + Sync>,
@@ -36,7 +36,7 @@ impl VFCandidateHydrator {
         safety_level: SafetyLevel,
         for_user_id: u64,
         context: Option<TwitterContextViewer>,
-    ) -> HashMap<u64, Result<Option<FilteredReason>>> {
+    ) -> HashMap<u64, Result<TweetVisibility>> {
         if tweet_ids.is_empty() {
             return HashMap::new();
         }
@@ -83,6 +83,8 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {
             }
         }
 
+        in_network_ids.sort_unstable();
+        in_network_ids.dedup();
         oon_ids.sort_unstable();
         oon_ids.dedup();
 
@@ -104,8 +106,12 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {
 
         let (in_network_result, oon_result) = join(in_network_future, oon_future).await;
         let mut all_results: HashMap<u64, Result<Option<FilteredReason>>> = HashMap::new();
-        all_results.extend(in_network_result);
-        all_results.extend(oon_result);
+        all_results.extend(
+            oon_result
+                .into_iter()
+                .chain(in_network_result)
+                .map(|(id, r)| (id, r.map(|t| t.reason))),
+        );
 
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -136,7 +142,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {
     }
 }
 
-fn should_drop_ancillary(
+pub(crate) fn should_drop_ancillary(
     candidate: &PostCandidate,
     vf_results: &HashMap<u64, Result<Option<FilteredReason>>>,
 ) -> bool {

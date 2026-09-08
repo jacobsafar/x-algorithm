@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from xrex.driver.driver import (
+from xrex.driver.core import (
     NUM_PHYSICAL_DEVICES_PER_NODE,
     DriverConfig,
     MultiRunDriverState,

@@ -1,5 +1,6 @@
 use crate::discovery::{build_vf_channel, VfChannel, VfChannelError, VfChannelParams, VfDiscovery};
 use crate::models::{Action, FilteredReason, SafetyResult};
+use crate::tweet_safety_label::{proto_to_safety_label_map, SafetyLabelFailure};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,6 +13,7 @@ use thrift::protocol::{
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
+use xai_safety_label_store::types::SafetyLabelMap;
 use xai_stats_receiver::global_stats_receiver;
 use xai_strato::{
     decode, encode, MValCodec, StratoGrpc, StratoGrpcConfig, StratoResult, StratoValue,
@@ -103,6 +105,12 @@ impl MValCodec for SafetyLevel {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TweetVisibility {
+    pub reason: Option<FilteredReason>,
+    pub safety_labels: Result<SafetyLabelMap, SafetyLabelFailure>,
+}
+
 #[async_trait]
 pub trait VfClient {
     async fn get_result(
@@ -111,7 +119,7 @@ pub trait VfClient {
         safety_level: SafetyLevel,
         for_user_id: u64,
         context: Option<TwitterContextViewer>,
-    ) -> HashMap<u64, Result<Option<FilteredReason>>>;
+    ) -> HashMap<u64, Result<TweetVisibility>>;
 }
 
 pub struct StratoVfClient {
@@ -154,7 +162,7 @@ impl VfClient for StratoVfClient {
         safety_level: SafetyLevel,
         for_user_id: u64,
         context: Option<TwitterContextViewer>,
-    ) -> HashMap<u64, Result<Option<FilteredReason>>> {
+    ) -> HashMap<u64, Result<TweetVisibility>> {
         let client = &self.grpc_client;
         let view = VisibilityFilteringLookupContext {
             safety_level,
@@ -172,13 +180,16 @@ impl VfClient for StratoVfClient {
             })
             .collect::<Vec<(String, String, Vec<Vec<u8>>)>>();
         let result_batch = client.batch_call(calls, context.as_ref()).await;
-        let mut result_map: HashMap<u64, Result<Option<FilteredReason>>> = HashMap::new();
+        let mut result_map: HashMap<u64, Result<TweetVisibility>> = HashMap::new();
         for (tweet_id, bytes_result) in tweet_ids.iter().zip(result_batch) {
             let item_result = match bytes_result {
                 Ok(bytes) => {
                     let decoded: StratoResult<StratoValue<FilteredReason>> = decode(&bytes);
                     match decoded {
-                        StratoResult::Ok(strato_value) => Ok(strato_value.v),
+                        StratoResult::Ok(strato_value) => Ok(TweetVisibility {
+                            reason: strato_value.v,
+                            safety_labels: Err(SafetyLabelFailure::LookupFailed),
+                        }),
                         StratoResult::Err(err) => {
                             Err(anyhow!("Strato error code {}: {}", err.code, err.message))
                         }
@@ -315,17 +326,33 @@ fn result_to_reason(result: vf_pb::TweetVisibilityResult) -> Option<FilteredReas
     }
 }
 
+fn result_to_visibility(mut result: vf_pb::TweetVisibilityResult) -> TweetVisibility {
+    let safety_labels = result
+        .safety_labels
+        .take()
+        .map(|m| proto_to_safety_label_map(&m))
+        .ok_or(SafetyLabelFailure::LookupFailed);
+    TweetVisibility {
+        reason: result_to_reason(result),
+        safety_labels,
+    }
+}
+
 fn results_to_map(
     requested_tweet_ids: &[u64],
     results: Vec<vf_pb::TweetVisibilityResult>,
-) -> HashMap<u64, Result<Option<FilteredReason>>> {
-    let mut map: HashMap<u64, Result<Option<FilteredReason>>> = results
+) -> HashMap<u64, Result<TweetVisibility>> {
+    let mut map: HashMap<u64, Result<TweetVisibility>> = results
         .into_iter()
-        .map(|r| (r.tweet_id, Ok(result_to_reason(r))))
+        .map(|r| (r.tweet_id, Ok(result_to_visibility(r))))
         .collect();
     for &tweet_id in requested_tweet_ids {
-        map.entry(tweet_id)
-            .or_insert_with(|| Ok(Some(FilteredReason::UnspecifiedReason)));
+        map.entry(tweet_id).or_insert_with(|| {
+            Ok(TweetVisibility {
+                reason: Some(FilteredReason::UnspecifiedReason),
+                safety_labels: Err(SafetyLabelFailure::LookupFailed),
+            })
+        });
     }
     map
 }
@@ -333,7 +360,7 @@ fn results_to_map(
 fn rpc_error_map(
     tweet_ids: &[u64],
     status: &tonic::Status,
-) -> HashMap<u64, Result<Option<FilteredReason>>> {
+) -> HashMap<u64, Result<TweetVisibility>> {
     tweet_ids
         .iter()
         .map(|&tweet_id| {
@@ -397,7 +424,7 @@ impl VfClient for XaiVfClient {
         safety_level: SafetyLevel,
         for_user_id: u64,
         context: Option<TwitterContextViewer>,
-    ) -> HashMap<u64, Result<Option<FilteredReason>>> {
+    ) -> HashMap<u64, Result<TweetVisibility>> {
         if tweet_ids.is_empty() {
             return HashMap::new();
         }
@@ -471,7 +498,7 @@ impl VfClient for MockVfClient {
         _safety_level: SafetyLevel,
         _for_user_id: u64,
         _context: Option<TwitterContextViewer>,
-    ) -> HashMap<u64, Result<Option<FilteredReason>>> {
+    ) -> HashMap<u64, Result<TweetVisibility>> {
         HashMap::new()
     }
 }
@@ -631,13 +658,22 @@ mod rust_vf_tests {
 
         let map = results_to_map(&[1, 2, 3, 4], results);
 
-        assert!(matches!(map.get(&1), Some(Ok(None))));
+        assert!(matches!(
+            map.get(&1),
+            Some(Ok(TweetVisibility { reason: None, .. }))
+        ));
         assert!(matches!(
             map.get(&2),
-            Some(Ok(Some(FilteredReason::AuthorIsUnsafe)))
+            Some(Ok(TweetVisibility {
+                reason: Some(FilteredReason::AuthorIsUnsafe),
+                ..
+            }))
         ));
         match map.get(&3) {
-            Some(Ok(Some(FilteredReason::SafetyResult(sr)))) => {
+            Some(Ok(TweetVisibility {
+                reason: Some(FilteredReason::SafetyResult(sr)),
+                ..
+            })) => {
                 assert!(matches!(sr.action, Action::Drop(_)));
             }
             other => panic!("unexpected mapping for id 3: {other:?}"),
@@ -645,10 +681,73 @@ mod rust_vf_tests {
         assert!(
             matches!(
                 map.get(&4),
-                Some(Ok(Some(FilteredReason::UnspecifiedReason)))
+                Some(Ok(TweetVisibility {
+                    reason: Some(FilteredReason::UnspecifiedReason),
+                    ..
+                }))
             ),
             "missing response ids fail closed"
         );
+    }
+
+    #[test]
+    fn results_to_map_converts_labels_and_fails_closed() {
+        use xai_x_thrift::tweet_safety_label::SafetyLabelType;
+
+        let results = vec![
+            vf_pb::TweetVisibilityResult {
+                tweet_id: 1,
+                action: Some(vf_pb::Action {
+                    kind: Some(vf_pb::action::Kind::Allow(true)),
+                }),
+                filtered_reason: None,
+                safety_labels: Some(vf_pb::SafetyLabelMap {
+                    labels: HashMap::from([(
+                        i32::from(SafetyLabelType::NSFW_HIGH_PRECISION),
+                        vf_pb::SafetyLabel {
+                            source: Some("some rule".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                }),
+            },
+            vf_pb::TweetVisibilityResult {
+                tweet_id: 2,
+                action: Some(vf_pb::Action {
+                    kind: Some(vf_pb::action::Kind::Allow(true)),
+                }),
+                filtered_reason: None,
+                safety_labels: None,
+            },
+        ];
+
+        let map = results_to_map(&[1, 2, 3], results);
+
+        match map.get(&1) {
+            Some(Ok(r)) => {
+                assert_eq!(r.reason, None);
+                let labels = r.safety_labels.as_ref().expect("labels present");
+                let label = labels
+                    .get(&SafetyLabelType::NSFW_HIGH_PRECISION)
+                    .expect("label converted");
+                assert_eq!(label.source.as_deref(), Some("some rule"));
+            }
+            other => panic!("unexpected mapping for id 1: {other:?}"),
+        }
+        match map.get(&2) {
+            Some(Ok(r)) => {
+                assert_eq!(r.reason, None);
+                assert!(r.safety_labels.is_err(), "absent map stays unavailable");
+            }
+            other => panic!("unexpected mapping for id 2: {other:?}"),
+        }
+        match map.get(&3) {
+            Some(Ok(r)) => {
+                assert_eq!(r.reason, Some(FilteredReason::UnspecifiedReason));
+                assert!(r.safety_labels.is_err(), "missing ids fail closed");
+            }
+            other => panic!("unexpected mapping for id 3: {other:?}"),
+        }
     }
 
     #[test]
@@ -667,7 +766,10 @@ mod rust_vf_tests {
         let map = results_to_map(&[7], results);
 
         match map.get(&7) {
-            Some(Ok(Some(FilteredReason::SafetyResult(sr)))) => {
+            Some(Ok(TweetVisibility {
+                reason: Some(FilteredReason::SafetyResult(sr)),
+                ..
+            })) => {
                 assert!(matches!(sr.action, Action::Interstitial));
             }
             other => panic!("interstitial should wrap as SafetyResult, got: {other:?}"),
@@ -753,11 +855,17 @@ mod rust_vf_tests {
         assert_eq!(result.len(), 2);
         assert!(matches!(
             result.get(&10),
-            Some(Ok(Some(FilteredReason::AuthorIsUnsafe)))
+            Some(Ok(TweetVisibility {
+                reason: Some(FilteredReason::AuthorIsUnsafe),
+                ..
+            }))
         ));
         assert!(matches!(
             result.get(&20),
-            Some(Ok(Some(FilteredReason::AuthorIsUnsafe)))
+            Some(Ok(TweetVisibility {
+                reason: Some(FilteredReason::AuthorIsUnsafe),
+                ..
+            }))
         ));
         handle.abort();
     }
@@ -896,11 +1004,17 @@ mod rust_vf_tests {
         assert_eq!(result.len(), 2);
         assert!(matches!(
             result.get(&10),
-            Some(Ok(Some(FilteredReason::AuthorIsUnsafe)))
+            Some(Ok(TweetVisibility {
+                reason: Some(FilteredReason::AuthorIsUnsafe),
+                ..
+            }))
         ));
         assert!(matches!(
             result.get(&20),
-            Some(Ok(Some(FilteredReason::UnspecifiedReason)))
+            Some(Ok(TweetVisibility {
+                reason: Some(FilteredReason::UnspecifiedReason),
+                ..
+            }))
         ));
         handle.abort();
     }
@@ -976,7 +1090,10 @@ mod rust_vf_tests {
         assert_eq!(result.len(), tweet_ids.len());
         for id in 1..=XAI_VF_MAX_BATCH_SIZE as u64 {
             assert!(
-                matches!(result.get(&id), Some(Ok(None))),
+                matches!(
+                    result.get(&id),
+                    Some(Ok(TweetVisibility { reason: None, .. }))
+                ),
                 "chunk-1 id {id} should Allow"
             );
         }

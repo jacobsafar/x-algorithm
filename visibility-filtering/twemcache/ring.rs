@@ -27,13 +27,9 @@ impl HashRing {
                 md.update(i.to_string().as_bytes());
                 let hash = md.finalize_reset();
 
-                for offset in [0, 4, 8, 12] {
-                    let value = u32::from_le_bytes([
-                        hash[offset],
-                        hash[offset + 1],
-                        hash[offset + 2],
-                        hash[offset + 3],
-                    ]) as u64;
+                let (words, _remainder) = hash.as_slice().as_chunks::<4>();
+                for &word in words {
+                    let value = u32::from_le_bytes(word) as u64;
                     ring.insert(value, server.clone());
                 }
             }

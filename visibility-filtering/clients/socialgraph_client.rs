@@ -29,58 +29,40 @@ pub trait SocialgraphClient: Send + Sync {
     ) -> HashMap<u64, bool>;
 }
 
-#[derive(Default)]
-pub struct MockSocialgraphClient {
-    pub relationships: HashMap<(u64, u64), ViewerAuthorRelationship>,
-    pub super_follows: HashMap<(u64, u64), bool>,
-}
+#[cfg(test)]
+pub struct FakeSocialgraphClient;
 
+#[cfg(test)]
 #[async_trait]
-impl SocialgraphClient for MockSocialgraphClient {
+impl SocialgraphClient for FakeSocialgraphClient {
     async fn batch_check_relationships(
         &self,
-        viewer_id: u64,
+        _viewer_id: u64,
         author_ids: &[u64],
     ) -> HashMap<u64, ViewerAuthorRelationship> {
         author_ids
             .iter()
-            .map(|&author_id| {
-                let rel = self
-                    .relationships
-                    .get(&(viewer_id, author_id))
-                    .cloned()
-                    .unwrap_or_default();
-                (author_id, rel)
-            })
+            .map(|&author_id| (author_id, ViewerAuthorRelationship::default()))
             .collect()
     }
 
     async fn batch_check_super_follows(
         &self,
-        viewer_id: u64,
+        _viewer_id: u64,
         author_ids: &[u64],
     ) -> HashMap<u64, bool> {
         author_ids
             .iter()
-            .map(|&author_id| {
-                let follows = self
-                    .super_follows
-                    .get(&(viewer_id, author_id))
-                    .copied()
-                    .unwrap_or(false);
-                (author_id, follows)
-            })
+            .map(|&author_id| (author_id, false))
             .collect()
     }
 }
 
 fn decode_packed_ids(packed: &[u8]) -> HashSet<u64> {
-    packed
-        .chunks_exact(8)
-        .map(|chunk| {
-            let arr: [u8; 8] = chunk.try_into().unwrap();
-            i64::from_le_bytes(arr) as u64
-        })
+    let (chunks, _remainder) = packed.as_chunks::<8>();
+    chunks
+        .iter()
+        .map(|&arr| i64::from_le_bytes(arr) as u64)
         .collect()
 }
 

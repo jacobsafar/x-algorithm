@@ -1,0 +1,42 @@
+# REVIEW TEMPLATE ONLY. No service/image/GPU resources have been created.
+# Resolve every placeholder and review the underlying runtime lock/image digest.
+# Cloud Run service MUST enforce IAM (no allUsers/allAuthenticatedUsers invoker).
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: REPLACE_PHOENIX_SHADOW_SERVICE
+  annotations:
+    run.googleapis.com/ingress: internal
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: '0'
+        autoscaling.knative.dev/maxScale: '1'
+        # GPU model, quota, billing and CPU/memory geometry need separate reviewed allocation.
+        # No GPU defaults are provided; a CPU-only deployment will fail native-model readiness.
+    spec:
+      serviceAccountName: REPLACE_LEAST_PRIVILEGE_RUNTIME_SERVICE_ACCOUNT
+      containerConcurrency: 1
+      timeoutSeconds: 5
+      containers:
+        - image: REPLACE_REGISTRY_IMAGE_AT_SHA256_DIGEST
+          args: ['--serve']
+          ports:
+            - containerPort: 8080
+          env:
+            - {name: PHOENIX_MANIFEST, value: /artifacts/manifest.json}
+            - {name: PHOENIX_MANIFEST_SHA256, value: REPLACE_REVIEWED_MANIFEST_SHA256}
+            - {name: PHOENIX_CHECKPOINT, value: /artifacts/checkpoint}
+            - {name: PHOENIX_CHECKPOINT_INVENTORY, value: /artifacts/checkpoint-inventory.json}
+            - {name: PHOENIX_FEATURE_ATLAS, value: /artifacts/feature-atlas.json}
+            - {name: PHOENIX_SID_SNAPSHOT, value: /artifacts/sid-snapshot.json}
+            - {name: MM_LOCAL_SNAPSHOT, value: /artifacts/mm-snapshot.parquet}
+            - {name: PHOENIX_IAM_AUDIENCE, value: REPLACE_EXACT_HTTPS_CLOUD_RUN_ORIGIN}
+            - {name: PHOENIX_CALLER_SERVICE_ACCOUNT, value: REPLACE_BACKEND_INVOKER_SERVICE_ACCOUNT}
+          # /artifacts must be staged from generation-pinned, hash-verified objects into
+          # a read-only mount or immutable image layer; never use a mutable latest prefix.
+          startupProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 30

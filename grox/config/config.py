@@ -86,9 +86,11 @@ class ModelName:
     GROK_4_MINI_CRITICAL_SAFETY = "critical-safety"
     EAPI_GROK_420_REASONING_X_ALGO = "eapi-grok-420-reasoning-x-algo"
     EAPI_GROK_420_REASONING_INTERNAL = "eapi-grok-420-reasoning-internal"
+    EAPI_GROK_4_1_FAST_X_ALGO = "eapi-grok-4-1-fast-x-algo"
     EAPI_GROK_4_3_INTERNAL = "eapi-grok-4-3-internal"
     EAPI_GROK_4_3_X_ALGO = "eapi-grok-4-3-x-algo"
-    EAPI_GROK_4_5_INTERNAL = "eapi-grok-4-5-internal"
+    EAPI_GROK_4_5_X_ALGO = "eapi-grok-4-5-x-algo"
+    EAPI_GROK_4_6_INTERNAL = "eapi-grok-4-6-internal"
 
 
 class NightOwlConfig(BaseModel):
@@ -109,6 +111,7 @@ class MediaHydrationConfig(BaseModel):
     image_tile_size: int = 448
     enable_light_dark_enhancement: bool = False
     enable_clahe_enhancement: bool = False
+    enable_motion_reveal: bool = False
     deluxe_fav_count_threshold: int = 64
     deluxe_video_max_frames: int = 30
     deluxe_video_tile_size: int = 600
@@ -120,6 +123,7 @@ class GroxKafkaLoaderConfig(BaseModel):
 
     prefetching_threshold: int = 256
     prefetching_batch_size: int = 1024
+    max_qps_per_partition: int | None = None
 
 
 class GrpcServerConfig(BaseModel):

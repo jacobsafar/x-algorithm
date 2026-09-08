@@ -1,5 +1,5 @@
 use crate::models::query::{RequestType, ScoredPostsQuery};
-use crate::params::EnableAdsInjectionLogging;
+use crate::params::{EnableAdsBrandSafetyVerdictV2, EnableAdsInjectionLogging};
 use prost::Message;
 use std::sync::Arc;
 use tonic::async_trait;
@@ -95,6 +95,12 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for AdsInjectionLoggingSideEffect {
             ip_address: query.ip_address.clone(),
             user_agent: query.user_agent.clone(),
             ads_injection_experiment_bucket: String::new(),
+            ddg_experiment_bucket: query
+                .params
+                .experiment_buckets(EnableAdsBrandSafetyVerdictV2)
+                .first()
+                .map(|b| format!("{}:{}", b.experiment, b.bucket))
+                .unwrap_or_default(),
             product_surface: product_surface.into(),
         };
 

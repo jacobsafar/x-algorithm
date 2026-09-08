@@ -12,6 +12,18 @@ const LATENCY_MS: &str = "filter_tweets_latency_ms";
 const BATCH_SIZE: &str = "filter_tweets_batch_size";
 const VERDICTS: &str = "filter_tweets_verdicts";
 const VERDICTS_BY_RULE: &str = "filter_tweets_verdicts_by_rule";
+const LOGGED_OUT_VIEWER: &str = "filter_tweets_logged_out_viewer";
+const VIEWER_ID_NORMALIZED: &str = "filter_tweets_viewer_id_normalized";
+
+pub(crate) fn record_viewer_state(raw: Option<u64>, normalized: Option<u64>) {
+    if normalized.is_some() {
+        return;
+    }
+    incr(LOGGED_OUT_VIEWER, &[], 1);
+    if raw.is_some() {
+        incr(VIEWER_ID_NORMALIZED, &[], 1);
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AggregatedVerdicts {

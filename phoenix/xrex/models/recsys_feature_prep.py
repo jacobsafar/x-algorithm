@@ -13,7 +13,9 @@ from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
 from xrex.data.recsys.feature_config import (
+    BoolFeature,
     CategoricalFeature,
+    Int64Feature,
     UserCategoricalFeature,
     UserFloatFeature,
 )
@@ -21,6 +23,15 @@ from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.models.layers import get_parameter
 from xrex.models.recsys_embedding import HashKeys, RecsysEmbeddings
 from xrex.models.scaling import ScaleConfig
+
+ENGAGEMENT_COUNT_ORDER: tuple[Int64Feature, ...] = (
+    Int64Feature.favCountSeq,
+    Int64Feature.replyCountSeq,
+    Int64Feature.repostCountSeq,
+    Int64Feature.quoteCountSeq,
+    Int64Feature.viewCountSeq,
+)
+ENGAGEMENT_COUNT_LOG2_SCALE: float = 32.0
 
 
 class FeaturePrepStreams(NamedTuple):
@@ -39,8 +50,9 @@ def _compute_post_age_bucket_linear(
     impr_ts_sec: jax.Array,
     post_creation_ts_sec: jax.Array,
     granularity_mins: int = 60,
+    max_mins: int = POST_AGE_MAX_MINUTES,
 ) -> jax.Array:
-    num_normal_buckets = POST_AGE_MAX_MINUTES // granularity_mins
+    num_normal_buckets = max_mins // granularity_mins
     overflow_bucket = num_normal_buckets + 1
     post_age_minutes = (impr_ts_sec - post_creation_ts_sec) // 60
     bucket = (post_age_minutes // granularity_mins) + 1
@@ -134,6 +146,7 @@ class FeaturePrepConfig(Config):
     fprop_dtype: str = "bfloat16"
     embed_init_scale: float = 1.0
     post_age_granularity_mins: int = 60
+    post_age_max_mins: int = POST_AGE_MAX_MINUTES
 
     scale_config: ScaleConfig = ScaleConfig()
 
@@ -148,6 +161,8 @@ class FeaturePrepConfig(Config):
     enable_user_gender: bool = True
     enable_user_age: bool = True
     enable_user_installed_apps: bool = True
+    # Retain the second prefix slot without reading or embedding unavailable context.
+    reserve_unavailable_user_feature_token: bool = False
     location_num_frequencies: int = 8
     num_countries: int = 250
     num_languages: int = 200
@@ -166,6 +181,8 @@ class FeaturePrepConfig(Config):
     enable_bridge_prob: bool = False
     product_surface_cardinality: int = 16
     timezone_cardinality: int = 32
+    enable_engagement_counts: bool = False
+    engagement_count_mlp_hidden_dim: int = 64
 
     enable_time_of_day: bool = False
     time_of_day_kernel: Literal["box", "triangle", "cosine"] = "cosine"
@@ -189,6 +206,9 @@ class FeaturePrepConfig(Config):
     enable_day_of_week: bool = False
     day_of_week_cardinality: int = 8
 
+    enable_is_author_followed_by_viewer: bool = False
+    enable_is_author_following_viewer: bool = False
+
     enable_post_sid: bool = False
     sid_embed_dim: int = 1024
     sid_num_levels: int = 6
@@ -198,11 +218,13 @@ class FeaturePrepConfig(Config):
 
     multimodal_embedding_dim: int = 0
     search_query_embedding_dim: int = 0
+    enable_stale_post: bool = False
 
     @property
     def has_user_features(self) -> bool:
         return (
-            self.enable_user_country
+            self.reserve_unavailable_user_feature_token
+            or self.enable_user_country
             or self.enable_user_language
             or self.enable_user_state
             or self.enable_user_dma_code
@@ -214,7 +236,7 @@ class FeaturePrepConfig(Config):
 
     @property
     def post_age_cardinality(self) -> int:
-        return POST_AGE_MAX_MINUTES // self.post_age_granularity_mins + 2
+        return self.post_age_max_mins // self.post_age_granularity_mins + 2
 
 
 def _feature_scale_spec(
@@ -418,6 +440,13 @@ def _build_user_features_token(
 ) -> tuple[jax.Array, jax.Array] | None:
     if not config.has_user_features:
         return None
+    if config.reserve_unavailable_user_feature_token:
+        # This is layout padding, not an observed demographic/context feature.
+        batch_size = batch["user_hashes"].shape[0]
+        return (
+            jnp.zeros((batch_size, 1, config.emb_size), dtype=DTYPE_BY_NAME[config.fprop_dtype]),
+            jnp.ones((batch_size, 1), dtype=jnp.bool_),
+        )
 
     fprop_dtype = DTYPE_BY_NAME[config.fprop_dtype]
     D = config.emb_size
@@ -523,7 +552,7 @@ def _add_context_features(
         impr_ts = _cast_jax(batch_seq["impr_ts"])
         creation_ts = _cast_jax(batch_seq["post_creation_ts_sec"])
         buckets = _compute_post_age_bucket_linear(
-            impr_ts, creation_ts, config.post_age_granularity_mins
+            impr_ts, creation_ts, config.post_age_granularity_mins, config.post_age_max_mins
         )
         result = result + _embed_categorical(
             buckets, config.post_age_cardinality, f"{prefix}_post_age_emb", config
@@ -588,6 +617,65 @@ def _add_context_features(
             result = result + _embed_categorical(
                 dow, config.day_of_week_cardinality, f"{prefix}_day_of_week_emb", config
             ).astype(fprop_dtype)
+
+    if config.enable_is_author_followed_by_viewer or config.enable_is_author_following_viewer:
+        bool_features = batch_seq.get("bool_features")
+        if bool_features is not None:
+            bool_features = _cast_jax(bool_features)
+            if config.enable_is_author_followed_by_viewer:
+                followed = bool_features[:, :, BoolFeature.isAuthorFollowedByViewerSeq].astype(
+                    jnp.int32
+                )
+                result = result + _embed_categorical(
+                    followed, 2, f"{prefix}_is_author_followed_by_viewer_emb", config
+                ).astype(fprop_dtype)
+            if config.enable_is_author_following_viewer:
+                following = bool_features[:, :, BoolFeature.isAuthorFollowingViewerSeq].astype(
+                    jnp.int32
+                )
+                result = result + _embed_categorical(
+                    following, 2, f"{prefix}_is_author_following_viewer_emb", config
+                ).astype(fprop_dtype)
+
+    if config.enable_engagement_counts:
+        i64 = batch_seq.get("int64_features")
+        if i64 is not None:
+            i64 = _cast_jax(i64)
+            x = jnp.stack(
+                [
+                    jnp.log2(jnp.maximum(i64[:, :, f.value].astype(jnp.float32), 0.0) + 1.0)
+                    for f in ENGAGEMENT_COUNT_ORDER
+                ],
+                axis=-1,
+            )
+            v = x / ENGAGEMENT_COUNT_LOG2_SCALE
+            v = jnp.concatenate([v, jnp.ones_like(v[..., :1])], axis=-1)
+            h_proj = _get_proj(
+                f"{prefix}_count_lograw_mlp_in",
+                v.shape[-1],
+                config.engagement_count_mlp_hidden_dim,
+                config,
+                role="input_proj",
+            )
+            out_proj = _get_proj(
+                f"{prefix}_count_lograw_mlp_out",
+                config.engagement_count_mlp_hidden_dim,
+                config.emb_size,
+                config,
+                role="input_proj",
+            )
+            hidden = jax.nn.gelu(jnp.dot(v.astype(h_proj.dtype), h_proj))
+            result = result + jnp.dot(hidden, out_proj).astype(fprop_dtype)
+
+    if config.enable_stale_post and prefix != "hist":
+        bools = batch_seq.get("bool_features")
+        if bools is not None and bools.shape[-1] > BoolFeature.isStalePost14d.value:
+            is_stale = _cast_jax(bools)[:, :, BoolFeature.isStalePost14d.value].astype(jnp.int32)
+            emb_table = _get_emb_table(
+                f"{prefix}_is_stale_post_14d_emb", 2, config.emb_size, config
+            )
+            one_hot = jax.nn.one_hot(jnp.clip(is_stale, 0, 1), 2)
+            result = result + jnp.dot(one_hot, emb_table).astype(fprop_dtype)
 
     return result
 
@@ -754,9 +842,14 @@ def _add_history_features(
             ).astype(fprop_dtype)
 
     if config.enable_bridge_prob:
+        from xai_proto import recsys_pb2
+
+        _bridge_idx = recsys_pb2.ContinuousActionName.BRIDGE_PROBABILITY
         cont_actions = batch["history_seq"].get("continuous_actions")
-        if cont_actions is not None:
-            bridge_p = jnp.clip(_cast_jax(cont_actions)[:, :, 0].astype(jnp.float32), 0.0, 1.0)
+        if cont_actions is not None and cont_actions.shape[-1] > _bridge_idx:
+            bridge_p = jnp.clip(
+                _cast_jax(cont_actions)[:, :, _bridge_idx].astype(jnp.float32), 0.0, 1.0
+            )
             result = result + _embed_scalar_times_vector(
                 bridge_p, "hist_bridge_prob_vec", config
             ).astype(fprop_dtype)

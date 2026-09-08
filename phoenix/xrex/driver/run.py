@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import jax
 
@@ -80,7 +80,8 @@ def _build_trainer_context(run_config: Any) -> Any:
     return ctx
 
 
-def run_driver_train(driver_config: Any, run_config: Any) -> None:
+def run_driver_train(driver_config: Any, run_config: Any, *,
+                     after_train: Callable[[Any], None] | None = None) -> None:
     del driver_config
     os.environ.setdefault("XAI_RUN_NAME", getattr(run_config, "name", "phoenix"))
 
@@ -132,6 +133,8 @@ def run_driver_train(driver_config: Any, run_config: Any) -> None:
 
     try:
         run_config.run()
+        if after_train is not None:
+            after_train(run_config)
     finally:
         if ctx.hooks is not None:
             ctx.hooks.on_train_stop()

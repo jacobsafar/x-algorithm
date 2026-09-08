@@ -1,4 +1,5 @@
 use crate::candidate_hydrators::ads_brand_safety_vf_hydrator::AdsBrandSafetyVfHydrator;
+use crate::candidate_hydrators::ai_trend_feedback_context_hydrator::AiTrendFeedbackContextHydrator;
 use crate::candidate_hydrators::bidirectional_follow_hydrator::BidirectionalFollowHydrator;
 use crate::candidate_hydrators::blocked_by_hydrator::BlockedByHydrator;
 use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;
@@ -43,7 +44,6 @@ use crate::filters::dedup_conversation_filter::DedupConversationFilter;
 use crate::filters::drop_duplicates_filter::DropDuplicatesFilter;
 use crate::filters::ineligible_subscription_filter::IneligibleSubscriptionFilter;
 use crate::filters::inventory_holdout_filter::InventoryHoldoutFilter;
-use crate::filters::muted_keyword_filter::MutedKeywordFilter;
 use crate::filters::new_user_min_engagement_filter::NewUserMinEngagementFilter;
 use crate::filters::oon_nsfw_simclusters_filter::OONNsfwSimclustersFilter;
 use crate::filters::oon_retweet_reply_filter::OONRetweetReplyFilter;
@@ -55,6 +55,7 @@ use crate::filters::self_tweet_filter::SelfTweetFilter;
 use crate::filters::topic_ids_filter::TopicIdsFilter;
 use crate::filters::vf_filter::VFFilter;
 use crate::filters::video_filter::VideoFilter;
+use crate::filters::viewer_muted_keyword_filter::ViewerMutedKeywordFilter;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params;
@@ -354,7 +355,7 @@ impl PhoenixCandidatePipeline {
             Box::new(PreviouslySeenPostsFilter),
             Box::new(PreviouslySeenPostsBackupFilter),
             Box::new(PreviouslyServedPostsFilter),
-            Box::new(MutedKeywordFilter::new()),
+            Box::new(ViewerMutedKeywordFilter::new()),
             Box::new(AuthorSocialgraphFilter),
             // Brazil 2026 election filter
 
@@ -394,14 +395,11 @@ impl PhoenixCandidatePipeline {
             feature_switches,
         ));
         let author_cold_start = crate::scorers::author_cold_start::AuthorColdStart { author_rules };
-        let ranking_scorer = Box::new(RankingScorer {
-            author_cold_start: author_cold_start.clone(),
-        });
+        let ranking_scorer = Box::new(RankingScorer { author_cold_start });
         let xds_vm_ranker_client = super::build_vm_ranker_xds_client(vm_ranker_xds).await;
         let vm_ranker = Box::new(VMRanker {
             client: vm_ranker_client,
             xds_client: xds_vm_ranker_client,
-            author_cold_start,
         });
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
             vec![phoenix_scorer, ranking_scorer, vm_ranker];
@@ -421,6 +419,9 @@ impl PhoenixCandidatePipeline {
                 strato_client: strato_client.clone(),
             }),
             Box::new(TopicFeedbackContextHydrator {
+                strato_client: strato_client.clone(),
+            }),
+            Box::new(AiTrendFeedbackContextHydrator {
                 strato_client: strato_client.clone(),
             }),
         ];

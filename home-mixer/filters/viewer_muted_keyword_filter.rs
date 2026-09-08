@@ -4,11 +4,11 @@ use std::sync::Arc;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 use xai_post_text::{MatchTweetGroup, TokenSequence, TweetTokenizer, UserMutes};
 
-pub struct MutedKeywordFilter {
+pub struct ViewerMutedKeywordFilter {
     pub tokenizer: Arc<TweetTokenizer>,
 }
 
-impl MutedKeywordFilter {
+impl ViewerMutedKeywordFilter {
     pub fn new() -> Self {
         let tokenizer = TweetTokenizer::new();
         Self {
@@ -17,7 +17,7 @@ impl MutedKeywordFilter {
     }
 }
 
-impl Filter<ScoredPostsQuery, PostCandidate> for MutedKeywordFilter {
+impl Filter<ScoredPostsQuery, PostCandidate> for ViewerMutedKeywordFilter {
     fn filter(
         &self,
         query: &ScoredPostsQuery,
@@ -84,7 +84,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_no_muted_keywords() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec![]);
 
         let candidates = vec![
@@ -100,7 +100,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simple_keyword_match() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["spam".to_string()]);
 
         let candidates = vec![
@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_hashtag_keyword_without_hash() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["widget".to_string()]);
 
         let candidates = vec![
@@ -138,7 +138,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_hashtag_keyword_with_hash() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["#launch".to_string()]);
 
         let candidates = vec![
@@ -156,7 +156,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_mention_keyword() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["exampleuser".to_string()]);
 
         let candidates = vec![
@@ -174,7 +174,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_multi_word_phrase() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["crypto scam".to_string()]);
 
         let candidates = vec![
@@ -192,7 +192,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_multiple_muted_keywords() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec![
             "spam".to_string(),
             "scam".to_string(),
@@ -215,7 +215,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_case_insensitive_matching() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["SPAM".to_string()]);
 
         let candidates = vec![
@@ -234,7 +234,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_unicode_and_accents() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["café".to_string()]);
 
         let candidates = vec![
@@ -252,7 +252,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_empty_candidates() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["spam".to_string()]);
 
         let candidates = vec![];
@@ -265,7 +265,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_all_candidates_removed() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["spam".to_string()]);
 
         let candidates = vec![
@@ -280,8 +280,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_cjk_keyword_whole_token_only() {
+        let filter = ViewerMutedKeywordFilter::new();
+        let query = create_test_query(vec!["京都".to_string()]);
+
+        let candidates = vec![
+            create_test_candidate(1, "東京都に行くのが楽しみ"),
+            create_test_candidate(2, "I visited 京都 last week"),
+            create_test_candidate(3, "unrelated content"),
+        ];
+
+        let result = filter.filter(&query, candidates);
+
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.removed[0].tweet_id, 2);
+        assert_eq!(result.kept.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_punctuation_handling() {
-        let filter = MutedKeywordFilter::new();
+        let filter = ViewerMutedKeywordFilter::new();
         let query = create_test_query(vec!["bitcoin".to_string()]);
 
         let candidates = vec![

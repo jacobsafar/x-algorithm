@@ -24,6 +24,7 @@ from numpy import typing as npt
 from xrex.data.recsys.observability import append_observation_mask_columns
 
 
+# Legacy v4 dataset provenance remains immutable even when the runtime advances.
 GRASSY_UPSTREAM_COMMIT = "a389166f6cf5da70a286b568c87695d4dcdce3a1"
 GRASSY_DATASET_MANIFEST = "grassy_phoenix_manifest.json"
 GRASSY_DATASET_MANIFEST_VERSION = 4
@@ -438,6 +439,12 @@ def load_observation_mask_sidecar(
         f"sidecar manifest is missing: {sidecar_manifest_path}",
     )
     sidecar, sidecar_raw = _read_json(sidecar_manifest_path, "sidecar manifest")
+    if sidecar.get("manifestVersion") == 3:
+        from xrex.data.recsys.observation_sidecars_v6 import load_v6
+        return load_v6(base_path=base, root=root, rows=parquet_num_rows, columns=parquet_num_columns)
+    if sidecar.get("manifestVersion") == 2:
+        from xrex.data.recsys.observation_sidecars_v5 import load_v5
+        return load_v5(base_path=base, root=root, rows=parquet_num_rows, columns=parquet_num_columns)
     _require_exact_keys(
         sidecar,
         {

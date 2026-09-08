@@ -835,6 +835,10 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
             if (_psid := post_seq.get("post_sids")) is not None
             else None,
         )
+        if (trained_mask := post_seq.get("trained_candidate_mask")) is not None:
+            result["trained_candidate_mask"] = np.pad(
+                trained_mask, ((0, batch_size - num_rows), (0, 0)), constant_values=True
+            )
         if (action_mask := post_seq.get("action_observation_mask")) is not None:
             result["action_observation_mask"] = pad_array(action_mask)
         if (
@@ -858,6 +862,9 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         else None,
         "sample_weights": pad_array(sw)
         if (sw := batch_unpadded.get("sample_weights")) is not None
+        else None,
+        "sample_source": pad_array(ss)
+        if (ss := batch_unpadded.get("sample_source")) is not None
         else None,
     }
 
@@ -909,6 +916,7 @@ class PhoenixDataset(Dataset):
     sid_num_levels: int = 0
 
     compute_post_unexplored_label: bool = False
+    enable_stale_post: bool = False
 
     multimodal_embedding_type: EmbeddingType | None = None
 
@@ -922,6 +930,8 @@ class PhoenixDataset(Dataset):
     # adjacent sidecars.  This stays false for released X datasets; enabling it
     # makes missing or invalid sidecars fatal before any row reaches training.
     require_label_observation_masks: bool = False
+    grassy_representation_manifest_path: str | None = None
+    grassy_representation_manifest_sha256: str | None = None
 
     @property
     def multimodal_embedding_dim(self) -> int:
@@ -1057,6 +1067,23 @@ class PhoenixDataset(Dataset):
                     f"Called make() on {self.__class__} but self.path was None"
                 )
 
+                grassy_representations = None
+                if self.require_label_observation_masks:
+                    if (self.grassy_representation_manifest_path is None
+                            or self.grassy_representation_manifest_sha256 is None
+                            or not self.use_post_sid or self.sid_num_levels != 6
+                            or self.multimodal_embedding_type is not None
+                            or self.offline_embedding_table_dir is not None
+                            or self.num_global_negatives_per_example != 0
+                            or self.num_negatives_per_example != 0):
+                        raise ValueError("Grassy training requires pinned real SID6 representations and the admitted offline recipe")
+                    from xrex.data.recsys.grassy_representations import load_grassy_representations
+                    grassy_representations = load_grassy_representations(
+                        dataset_root=self.path,
+                        manifest_path=self.grassy_representation_manifest_path,
+                        expected_sha256=self.grassy_representation_manifest_sha256,
+                    )
+
                 offline_emb_table: PostEmbeddingTable | None = None
                 if self.offline_embedding_table_dir is not None:
                     offline_emb_table = PostEmbeddingTable(self.offline_embedding_table_dir)
@@ -1184,6 +1211,8 @@ class PhoenixDataset(Dataset):
                             record_batch, self.conversion_label_window_ms
                         )
 
+                    if grassy_representations is not None:
+                        record_batch = grassy_representations.attach(record_batch)
                     batch = from_record_batch(
                         record_batch,
                         self.history_seq_len,
@@ -1203,6 +1232,7 @@ class PhoenixDataset(Dataset):
                         global_post_sids=global_post_sids,
                         sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
                         compute_post_unexplored_label=self.compute_post_unexplored_label,
+                        zero_stale_post_14d_candidate_counts=self.enable_stale_post,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -1323,6 +1353,9 @@ class PhoenixDataset(Dataset):
             "sample_weights": jax.ShapeDtypeStruct(sw.shape, sw.dtype)
             if (sw := example_data.get("sample_weights")) is not None
             else None,
+            "sample_source": jax.ShapeDtypeStruct(ss.shape, ss.dtype)
+            if (ss := example_data.get("sample_source")) is not None
+            else None,
         }
 
         return batch_shape
@@ -1395,6 +1428,7 @@ class PhoenixDataset(Dataset):
                 ),
                 product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
+                trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
                 if self.include_candidate_post_ids
                 else None,
@@ -1429,6 +1463,7 @@ class PhoenixDataset(Dataset):
             and self.candidate_negative_filter != CandidateNegativeFilter.NONE
             else None,
             sample_weights=np.ones((batch_size, 1), dtype=np.float32),
+            sample_source=np.zeros((batch_size, 1), dtype=np.bool_),
         )
         return batch
 
@@ -1524,6 +1559,7 @@ class PhoenixToyDataset(PhoenixDataset):
                 auth_hashes=self.hash_table.get_author_hash(candidate_author_ids),
                 product_surface=candidate_product_surface,
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
+                trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
                 post_ids=candidate_tweet_ids.astype(np.int64)
                 if self.include_candidate_post_ids
                 else None,

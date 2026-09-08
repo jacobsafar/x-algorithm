@@ -1,0 +1,40 @@
+name: Grassy CPU contracts
+on:
+  pull_request:
+    paths: ['phoenix/**', '.github/workflows/grassy-contracts.yml']
+  push:
+    paths: ['phoenix/**', '.github/workflows/grassy-contracts.yml']
+permissions:
+  contents: read
+concurrency:
+  group: grassy-contracts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy==2.4.2 pyarrow==24.0.0 google-auth==2.53.0 requests==2.34.2
+      - name: Verify exact data, masks, representation and negative authority
+        working-directory: phoenix
+        run: |
+          python - <<'PY'
+          import sys, unittest
+          sys.path.insert(0, 'tests')
+          modules = [
+              'test_observability', 'test_observation_sidecars',
+              'test_observation_sidecars_v5', 'test_grassy_model_contract',
+              'test_grassy_representations', 'test_grassy_negative_authority',
+              'test_observation_sidecars_v6', 'test_grassy_representations_v6',
+              'test_grassy_service',
+          ]
+          suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(name) for name in modules)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(not result.wasSuccessful())
+          PY

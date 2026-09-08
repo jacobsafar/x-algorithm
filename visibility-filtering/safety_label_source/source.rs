@@ -33,7 +33,7 @@ fn ttl_for_tweet(tweet_id: u64, now: SystemTime) -> Option<Duration> {
 }
 
 pub struct SafetyLabelSource {
-    cache: ExpiringCache<u64, vf_pb::SafetyLabelMap>,
+    cache: ExpiringCache<u64, Arc<vf_pb::SafetyLabelMap>>,
     remote: Arc<RemoteSource>,
 }
 
@@ -59,17 +59,16 @@ impl SafetyLabelSource {
     pub async fn get(
         &self,
         ids: &[u64],
-    ) -> HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>> {
+    ) -> HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {
         let total = ids.len();
-        let mut results: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>> =
+        let mut results: HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
             HashMap::with_capacity(total);
 
         let (local_misses, expired) = self.get_local(ids, &mut results);
         let batch_size = local_misses.len();
 
         let remote_results = self.remote.get(&local_misses).await;
-        self.backfill_local(&remote_results);
-        results.extend(remote_results);
+        self.backfill_local(remote_results, &mut results);
 
         self.emit_stats(total - batch_size, batch_size, expired);
 
@@ -79,7 +78,7 @@ impl SafetyLabelSource {
     fn get_local(
         &self,
         ids: &[u64],
-        results: &mut HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>,
+        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) -> (Vec<u64>, usize) {
         let mut misses = Vec::with_capacity(ids.len());
         let mut expired = 0;
@@ -98,14 +97,20 @@ impl SafetyLabelSource {
         (misses, expired)
     }
 
-    fn backfill_local(&self, results: &HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>) {
+    fn backfill_local(
+        &self,
+        remote_results: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>,
+        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+    ) {
         let wall_now = SystemTime::now();
-        for (&id, result) in results {
-            if let Ok(label_map) = result
+        for (id, result) in remote_results {
+            let result = result.map(Arc::new);
+            if let Ok(label_map) = &result
                 && let Some(ttl) = ttl_for_tweet(id, wall_now)
             {
-                self.cache.insert(id, label_map.clone(), ttl);
+                self.cache.insert(id, Arc::clone(label_map), ttl);
             }
+            results.insert(id, result);
         }
     }
 
@@ -257,12 +262,15 @@ mod tests {
         );
 
         let results1 = source.get(&[42]).await;
-        let first = results1.get(&42).unwrap().as_ref().unwrap().clone();
+        let first = Arc::clone(results1.get(&42).unwrap().as_ref().unwrap());
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
         assert!(source.cache.expiry_of(&42).is_some());
 
         let results2 = source.get(&[42]).await;
-        assert_eq!(results2.get(&42).unwrap().as_ref().unwrap(), &first);
+        assert!(Arc::ptr_eq(
+            results2.get(&42).unwrap().as_ref().unwrap(),
+            &first
+        ));
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
     }
 

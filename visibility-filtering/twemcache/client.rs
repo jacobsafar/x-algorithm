@@ -12,10 +12,6 @@ use super::key::{Key, Server, ServerSet, Value};
 use super::metrics::Metrics;
 use super::ring::HashRing;
 
-#[allow(dead_code)]
-pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(75);
-#[allow(dead_code)]
-pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) trait PoolFactory: Send + Sync {

@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import datetime
 import enum
+import functools
 import importlib
 import inspect
 import json
@@ -288,20 +289,21 @@ def to_dict(obj: Any, container: str = "???") -> Any:
     return obj
 
 
-def resolve_type_hints(dcls: Any) -> dict[str, Type[Any]]:
-    if isinstance(dcls, Config):
-        resolved_hints = type(dcls).get_type_hints()
-    elif isinstance(dcls, type):
-        if dataclasses.is_dataclass(dcls):
-            resolved_hints = get_type_hints(dcls)
-            field_names = [field.name for field in dataclasses.fields(dcls)]
-            return {name: resolved_hints[name] for name in field_names}
-        else:
-            return {}
+@functools.cache
+def _resolve_type_hints(cls: type) -> dict[str, Type[Any]]:
+    if issubclass(cls, Config):
+        resolved_hints = cls.get_type_hints()
+    elif dataclasses.is_dataclass(cls):
+        resolved_hints = get_type_hints(cls)
     else:
-        resolved_hints = get_type_hints(type(dcls))
-    field_names = [field.name for field in dataclasses.fields(dcls)]
-    return {name: resolved_hints[name] for name in field_names}
+        return {}
+    return {field.name: resolved_hints[field.name] for field in dataclasses.fields(cls)}
+
+
+def resolve_type_hints(dcls: Any) -> dict[str, Type[Any]]:
+    if isinstance(dcls, type):
+        return _resolve_type_hints(dcls)
+    return _resolve_type_hints(type(dcls))
 
 
 def replace_cli_subs(

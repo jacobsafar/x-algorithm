@@ -107,8 +107,8 @@ impl TwemcacheLookup for TwemcacheSource {
         let mut counts = ItemCounts::default();
 
         let map = self.cache.multi_get(&keys).await;
-        for (i, &tweet_id) in ids.iter().enumerate() {
-            let outcome = match map.get(&keys[i]) {
+        for (&tweet_id, key) in ids.iter().zip(&keys) {
+            let outcome = match map.get(key) {
                 Some(Ok(Some(bytes))) => match cached_value::decode(bytes) {
                     CacheLookup::Hit(label_map) => {
                         counts.hit += 1;

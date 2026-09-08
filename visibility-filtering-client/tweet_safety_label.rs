@@ -217,7 +217,7 @@ fn proto_to_safety_label(label: &vf_pb::SafetyLabel) -> SafetyLabel {
     }
 }
 
-fn proto_to_safety_label_map(proto: &vf_pb::SafetyLabelMap) -> SafetyLabelMap {
+pub(crate) fn proto_to_safety_label_map(proto: &vf_pb::SafetyLabelMap) -> SafetyLabelMap {
     proto
         .labels
         .iter()

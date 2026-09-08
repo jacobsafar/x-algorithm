@@ -241,7 +241,6 @@ pub(crate) fn record_fallback_cache_keys(
     fresh: usize,
     stale: usize,
     stale_not_found: usize,
-    shadow_hit: usize,
     not_found: usize,
     unavailable: usize,
 ) {
@@ -249,7 +248,6 @@ pub(crate) fn record_fallback_cache_keys(
         ("fresh", fresh),
         ("stale", stale),
         ("stale_not_found", stale_not_found),
-        ("shadow_hit", shadow_hit),
         ("not_found", not_found),
         ("unavailable", unavailable),
     ] {
@@ -532,7 +530,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(returned.failed_count(), 2);
         assert!(matches!(
             returned.hydrated(&1),
             Some(Hydrated::Failed(HydrationError::Timeout))

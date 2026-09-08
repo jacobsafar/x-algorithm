@@ -12,6 +12,9 @@ from xrex.data.parquet_recsys import (
     PhoenixToyDataset,
 )
 from xrex.data.recsys.constants import continuous_action_type_map
+from xrex.data.recsys.grassy_contract import (
+    GRASSY_FEATURE_POLICY, grassy_feature_prep_overrides,
+)
 from xrex.data.recsys.feature_config import CategoricalFeature
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
@@ -29,13 +32,12 @@ from xrex.models.recsys_model import (
 )
 from xrex.models.scaling import ScaleConfig
 from xrex.models.transformer import FeedForwardConfig, RematType, TransformerConfig
-from xrex.optimizers.optim import OptimConfig
 from xrex.optimizers.recsys.config import RecsysEmbeddingOptimConfig
+from xrex.optimizers.recsys.dense_optim import RecsysDenseOptimConfig
 from xrex.optimizers.recsys.rowwise_adagrad import RecsysRowwiseAdagradConfig
 from xrex.optimizers.schedule import ConstantSampleSchedule
 from xrex.train.parallel_config import ParallelConfig
-from xrex.train.trainer import CheckpointConfig
-from xrex.train.trainer_recsys import RecsysTrainer
+from xrex.train.trainer_recsys import RecsysCheckpointConfig, RecsysTrainer
 
 PAD_TOKEN = 0
 INPUT_VOCAB_K = 512
@@ -82,20 +84,24 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         enable_user_embedding=use_user_emb,
         enable_post_embedding=use_post_emb,
         post_age_granularity_mins=post_age_mins,
+        post_age_max_mins=mparams.get("post_age_max_mins", POST_AGE_MAX_MINUTES),
         sid_embed_dim=mparams.get("sid_embed_dim", 1024),
         sid_num_levels=mparams.get("sid_num_levels", 6),
         sid_codebook_size=mparams.get("sid_codebook_size", 1024),
         sid_hash_level=mparams.get("sid_hash_level", False),
         sid_cross_attn=mparams.get("sid_cross_attn", False),
+        enable_stale_post=mparams.get("enable_stale_post", False),
     )
+
+    if mparams.get("require_label_observation_masks", False):
+        structural.update(grassy_feature_prep_overrides())
 
     if "feature_prep" in mparams:
         return replace(mparams["feature_prep"], **structural)
 
     enable_ctx = mparams.get("enable_context_features", True)
     use_post_sid = mparams.get("use_post_sid", False)
-    return FeaturePrepConfig(
-        **structural,
+    defaults = dict(
         enable_ip_address=mparams.get("ip_vocab_size", 0) > 0 and use_user_emb,
         enable_user_country=mparams.get("enable_user_country_feature", False),
         enable_user_language=mparams.get("enable_user_language_feature", False),
@@ -116,6 +122,7 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         hour_of_day_dither_fraction=0.0,
         enable_day_of_week=enable_ctx,
     )
+    return FeaturePrepConfig(**{**defaults, **structural})
 
 
 DATASET_TYPES: list[str] = [
@@ -142,7 +149,9 @@ def _make_cfg(
     )
 
     input_vocab_size = _round_up_to_multiple(input_vocab_size, INPUT_VOCAB_K)
-    output_vocab_size = _round_up_to_multiple(ACTION_TYPE_MAP_LEN, OUTPUT_VOCAB_K)
+    output_vocab_size = cfg.get("output_vocab_size") or _round_up_to_multiple(
+        ACTION_TYPE_MAP_LEN, OUTPUT_VOCAB_K
+    )
     num_continuous_actions = _round_up_to_multiple(
         len(continuous_action_type_map), CONTINUOUS_ACTION_TYPE_MAP_LEN
     )
@@ -193,6 +202,7 @@ def _make_dataset(
 
     _use_post_sid = mparams.get("use_post_sid", False)
     _sid_num_levels = mparams.get("sid_num_levels", 6)
+    _enable_stale_post = mparams.get("enable_stale_post", False)
 
     match dataset_type:
         case "aggregated_kafka":
@@ -204,7 +214,7 @@ def _make_dataset(
                 input_vocab_size=mparams["input_vocab_size"],
                 num_continuous_actions=mparams["num_continuous_actions"],
                 num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
-                num_kafka_partitions=1024,
+                num_kafka_partitions=mparams.get("num_kafka_partitions", 1024),
                 output_vocab_size=mparams["output_vocab_size"],
                 multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
                 use_post_sid=_use_post_sid,
@@ -212,6 +222,7 @@ def _make_dataset(
                 require_label_observation_masks=mparams.get(
                     "require_label_observation_masks", False
                 ),
+                enable_stale_post=_enable_stale_post,
             )
         case "toy_dataset":
             return PhoenixToyDataset(
@@ -225,6 +236,7 @@ def _make_dataset(
                 multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
                 use_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
+                enable_stale_post=_enable_stale_post,
             )
         case _:
             raise ValueError(f"Uknown {dataset_type=}, must be one of {DATASET_TYPES}")
@@ -251,7 +263,6 @@ def _home_direct_packed_base() -> dict:
         "base_batch_size": 32,
         "dp": 1,
         "total_samples": 1e11,
-        "emb_learning_rate": 0.2,
         "log_q_correction": True,
         "continuous_metrics_mae_mean": True,
         "post_age_granularity_mins": 60,
@@ -268,6 +279,7 @@ def _home_direct_packed_base() -> dict:
         "sid_codebook_size": 256,
         "sid_hash_level": True,
         "sid_cross_attn": False,
+        "enable_stale_post": True,
         "feature_prep_enabled": True,
         "feature_prep": FeaturePrepConfig(
             enable_post_sid=True,
@@ -284,6 +296,9 @@ def _home_direct_packed_base() -> dict:
             enable_dwell_time=True,
             enable_time_of_day=False,
             enable_hour_of_day=True,
+            enable_is_author_followed_by_viewer=True,
+            enable_is_author_following_viewer=True,
+            enable_engagement_counts=True,
             hour_of_day_dither_fraction=0.1,
         ),
         "seqpack_distribution": BetaLengthDistribution(
@@ -301,8 +316,25 @@ _H100_OVERRIDES = {
     "bs_per_device": 256,
     "ep": 256,
     "attn_impl": "pallas_ranker_varlen_attn",
-    "learning_rate": 1e-3,
+    "learning_rate": 7.1e-4,
     "checkpoint_every_n": 150,
+    "optim_config": RecsysDenseOptimConfig(
+        optim="muon",
+        muon_consistent_rms=0.2,
+        muon_matrix_weight_decay=0.014,
+        muon_split_fused="qkv:128",
+        adam_embedding_weight_decay=0.014,
+        b1=0.95,
+        b2=0.98,
+    ),
+    "emb_optim_config": RecsysEmbeddingOptimConfig(
+        rowwise_adagrad=RecsysRowwiseAdagradConfig(
+            learning_rate=0.28,
+            half_life_steps=2500,
+            lazy_decay=True,
+            weight_decay=2.8e-4,
+        ),
+    ),
 }
 
 _GB300_OVERRIDES = {
@@ -313,10 +345,29 @@ _GB300_OVERRIDES = {
     "unroll_layer_stack": True,
     "learning_rate": 5e-4,
     "checkpoint_every_n": 300,
+    "optim_config": RecsysDenseOptimConfig(
+        optim="muon",
+        muon_consistent_rms=0.2,
+        muon_matrix_weight_decay=0.01,
+        muon_split_fused="qkv:128",
+        adam_embedding_weight_decay=0.01,
+        b1=0.95,
+        b2=0.98,
+    ),
+    "emb_optim_config": RecsysEmbeddingOptimConfig(
+        rowwise_adagrad=RecsysRowwiseAdagradConfig(
+            learning_rate=0.28,
+            half_life_steps=5000,
+            lazy_decay=True,
+            weight_decay=1.4e-4,
+        ),
+    ),
 }
 
 _NANO_OVERRIDES = {
-    "learning_rate": 2e-3,
+    "learning_rate": _GB300_OVERRIDES["learning_rate"],
+    "optim_config": _GB300_OVERRIDES["optim_config"],
+    "emb_optim_config": _GB300_OVERRIDES["emb_optim_config"],
     "bs_per_device": 64,
     "ep": 1,
     "dp": 1,
@@ -410,14 +461,79 @@ MODEL_CFGS = {
             **_home_direct_packed_base(),
             **_NANO_OVERRIDES,
             "require_label_observation_masks": True,
+            "grassy_feature_policy": GRASSY_FEATURE_POLICY,
             "enable_engagement_counts": False,
+            # Fresh state starts at zero; max_steps=99 executes exactly 100 updates.
+            "total_samples": 6368,
+            "num_negatives_per_example": 0,
+            "log_q_correction": False,
             "compute_post_unexplored_label": False,
             "num_kafka_partitions": 1,
         },
         user_vocab_size=100_000,
         item_vocab_size=100_000,
         author_vocab_size=30_000,
-        ip_vocab_size=10_000,
+        ip_vocab_size=0,
+    ),
+    "grassy_home_direct_packed_nano_90d": _make_cfg(
+        {
+            **_home_direct_packed_base(),
+            **_NANO_OVERRIDES,
+            "require_label_observation_masks": True,
+            "grassy_feature_policy": GRASSY_FEATURE_POLICY,
+            "grassy_candidate_age_policy": "grassy_candidate_age_90d_v1",
+            "grassy_post_age_encoding": "grassy_post_age_30h_80bins_v1",
+            "post_age_granularity_mins": 1800,
+            "post_age_max_mins": 144000,
+            "enable_engagement_counts": False,
+            # Fresh state starts at zero; max_steps=99 executes exactly 100 updates.
+            "total_samples": 6368,
+            "num_negatives_per_example": 0,
+            "log_q_correction": False,
+            "compute_post_unexplored_label": False,
+            "num_kafka_partitions": 1,
+        },
+        user_vocab_size=100_000,
+        item_vocab_size=100_000,
+        author_vocab_size=30_000,
+        ip_vocab_size=0,
+    ),
+    "xrecsys_search": _make_cfg(
+        {
+            "history_seq_len": 1022,
+            "candidate_seq_len": 64,
+            "enable_user_country_feature": True,
+            "enable_user_language_feature": True,
+            "enable_user_location_feature": False,
+            "enable_user_gender_feature": False,
+            "enable_user_age_feature": False,
+            "num_layers": 8,
+            "emb_size": 2560,
+            "emb_table_width": 1024,
+            "query_heads": 20,
+            "kv_heads": 4,
+            "base_batch_size": 32,
+            "bs_per_device": 128,
+            "tp": 1,
+            "ep": 512,
+            "fsdp": 1,
+            "dp": 2,
+            "total_samples": 1e11,
+            "group_id": "user_action_sequence_xrecsys",
+            "learning_rate": 2e-3,
+            "attn_impl": "pallas_ranker_attn",
+            "log_q_correction": True,
+            "use_product_surface": True,
+            "post_age_granularity_mins": 60,
+            "output_vocab_size": 128,
+            "metric_group": "search",
+            "use_dense_action_table": True,
+            "condition_search_relevance_on_prompt": True,
+        },
+        user_vocab_size=100_000_000,
+        item_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+        ip_vocab_size=10_000_000,
     ),
 }
 
@@ -474,8 +590,17 @@ CONFIGS: dict[str, RecsysTrainer] = _ConfigRegistry()
 
 for config in configs:
     config_name, mparams = config["config_name__mparams"]
+    assert isinstance(mparams, dict)
     dataset_type = config["dataset_type"]
     config_name_gen = f"{config_name}_{dataset_type}"
+    # Other readers do not load and bind Grassy per-head sidecars.
+    if mparams.get("require_label_observation_masks", False) and dataset_type not in (
+        "offline_kafka_dump",
+    ):
+        continue
+
+    if dataset_type == "grpc_recsys" and mparams.get("enable_stale_post", False):
+        mparams = {**mparams, "enable_stale_post": False}
 
     hash_table = HashTable(
         hash_keys=HashKeys(
@@ -555,6 +680,7 @@ for config in configs:
         reuse_run_id=False,
         evals=evals,
         model_config=RecsysAggregatedModelConfig(
+            use_dense_action_table=mparams.get("use_dense_action_table", False),
             multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
             search_query_embedding_dim=mparams.get("search_query_embedding_dim", 0),
             use_ip_address=use_ip_address,
@@ -568,6 +694,8 @@ for config in configs:
             sid_codebook_size=mparams.get("sid_codebook_size", 1024),
             sid_hash_level=mparams.get("sid_hash_level", False),
             sid_cross_attn=mparams.get("sid_cross_attn", False),
+            sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
+            sid_decoder_path=mparams.get("sid_decoder_path", ""),
             use_seqpack=mparams["use_seqpack"],
             right_anchored_rope=mparams.get("right_anchored_rope", False),
             user_features=user_features,
@@ -580,11 +708,22 @@ for config in configs:
             mask_candidate_positive_when_negative_action_present=mparams.get(
                 "mask_candidate_positive_when_negative_action_present", False
             ),
+            train_view_through_heads=mparams.get("train_view_through_heads", False),
+            concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
+            mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
+            split_head_training_by_source=mparams.get("split_head_training_by_source", False),
+            condition_search_relevance_on_prompt=mparams.get(
+                "condition_search_relevance_on_prompt", False
+            ),
             metric_group=mparams.get("metric_group", "default"),
+            metric_mask_keys=mparams.get("metric_mask_keys"),
             continuous_metrics_mae_mean=mparams.get("continuous_metrics_mae_mean", False),
             require_label_observation_masks=mparams.get(
                 "require_label_observation_masks", False
             ),
+            grassy_feature_policy=mparams.get("grassy_feature_policy"),
+            grassy_candidate_age_policy=mparams.get("grassy_candidate_age_policy", "legacy_48h_v1"),
+            grassy_post_age_encoding=mparams.get("grassy_post_age_encoding", "phoenix_post_age_1h_80bins_v1"),
             emb_table_width=mparams["emb_table_width"],
             history_seq_len=mparams["history_seq_len"],
             candidate_seq_len=mparams["candidate_seq_len"],
@@ -734,23 +873,29 @@ for config in configs:
             ep=mparams["ep"],
             dp=mparams["dp"],
         ),
-        optim_config=OptimConfig(
-            optim="adam",
-            weight_decay=1e-3,
-            b1=0.95,
-            b2=0.98,
+        optim_config=mparams.get(
+            "optim_config",
+            RecsysDenseOptimConfig(
+                optim="adam",
+                weight_decay=1e-3,
+                b1=0.95,
+                b2=0.98,
+            ),
         ),
         lr_schedule_in_samples_config=ConstantSampleSchedule(
             learning_rate=mparams["learning_rate"],
         ),
-        emb_optim_config=RecsysEmbeddingOptimConfig(
-            rowwise_adagrad=RecsysRowwiseAdagradConfig(
-                learning_rate=mparams.get("emb_learning_rate", 0.1),
+        emb_optim_config=mparams.get(
+            "emb_optim_config",
+            RecsysEmbeddingOptimConfig(
+                rowwise_adagrad=RecsysRowwiseAdagradConfig(
+                    learning_rate=mparams.get("emb_learning_rate", 0.1),
+                ),
             ),
         ),
         max_steps=int(mparams["total_samples"] / mparams["base_batch_size"]) - 100,
         max_samples=None,
-        checkpoint_config=CheckpointConfig(
+        checkpoint_config=RecsysCheckpointConfig(
             from_checkpoint=True,
             checkpoint_every_n=mparams.get("checkpoint_every_n", 100),
             shm_max_entries=3,
