@@ -20,7 +20,9 @@ class SimpleReplyScorer(ReplyScorer):
         system_prompt = reply_scoring_system_simple_prompt(100_000)
         convo.messages.append(Message(role=Role.SYSTEM, content=[system_prompt]))
         convo.messages.append(
-            ThreadRenderer.render(post, role=Role.HUMAN, include_signals=True)
+            ThreadRenderer.render(
+                post, role=Role.HUMAN, include_signals=True, include_follower_count=True
+            )
         )
         return convo
 

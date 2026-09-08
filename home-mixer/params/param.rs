@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-08-12T04:09:22Z
+// mirrored from config feature-switch defaults; last sync 2026-09-04T16:22:24Z
 use xai_feature_switches::param;
 
 param!(
@@ -80,7 +80,7 @@ param!(
     ShadowTrafficPhoenixClusterRates,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
-    vec!["Experiment6Fou:1.5".to_string()]
+    vec![]
 );
 param!(
     ShadowTrafficDefaultPercent,
@@ -92,6 +92,12 @@ param!(
     EnablePhoenixRetrievalStatsExperimentBucket,
     bool,
     "rust_home_mixer_enable_phoenix_retrieval_stats_experiment_bucket",
+    false
+);
+param!(
+    EnablePhoenixScoreStatsExperimentBucket,
+    bool,
+    "rust_home_mixer_enable_phoenix_score_stats_experiment_bucket",
     false
 );
 param!(
@@ -122,13 +128,13 @@ param!(
     PhoenixAggregationType,
     String,
     "rust_home_mixer_phoenix_aggregation_type",
-    "DENSE_WITH_SHORT_DWELL"
+    "DENSE_WITH_LONG_DWELL"
 );
 param!(
     PhoenixRetrievalAggregationType,
     String,
     "rust_home_mixer_phoenix_retrieval_aggregation_type",
-    "DENSE_WITH_SHORT_DWELL"
+    "DENSE_WITH_LONG_DWELL"
 );
 
 param!(
@@ -243,17 +249,17 @@ param!(
     "rust_home_mixer_log_slate_context",
     false
 );
+param!(RerankerHeadTag, i64, "rust_home_mixer_reranker_head_tag", 0);
 param!(
     OonWeightFactor,
     f64,
     "rust_home_mixer_oon_weight_factor",
     0.75
 );
-
 param!(
-    EnableMpnScoring,
+    MultiplierPreOffset,
     bool,
-    "rust_home_mixer_enable_mpn_scoring",
+    "rust_home_mixer_multiplier_pre_offset",
     false
 );
 
@@ -330,7 +336,7 @@ param!(
     VideoOpenWeight,
     f64,
     "rust_home_mixer_video_open_weight",
-    0.05
+    0.07
 );
 param!(ClickWeight, f64, "rust_home_mixer_click_weight", 0.4);
 param!(OpenLinkWeight, f64, "rust_home_mixer_open_link_weight", 0.2);
@@ -340,7 +346,7 @@ param!(
     "rust_home_mixer_profile_click_weight",
     0.0
 );
-param!(VqvWeight, f64, "rust_home_mixer_vqv_weight", 0.05);
+param!(VqvWeight, f64, "rust_home_mixer_vqv_weight", 0.0);
 param!(ShareWeight, f64, "rust_home_mixer_share_weight", 2.0);
 param!(
     ShareViaDmWeight,
@@ -354,7 +360,7 @@ param!(
     "rust_home_mixer_share_via_copy_link_weight",
     20.0
 );
-param!(DwellWeight, f64, "rust_home_mixer_dwell_weight", 0.0);
+param!(DwellWeight, f64, "rust_home_mixer_dwell_weight", 0.05);
 param!(QuoteWeight, f64, "rust_home_mixer_quote_weight", 5.0);
 param!(
     QuotedClickWeight,
@@ -620,16 +626,10 @@ param!(
     "Experiment3"
 );
 param!(
-    VMRankerValueModelId,
+    PhoenixExperimentOverrides,
     String,
-    "rust_home_mixer_vm_ranker_value_model_id",
-    "dpp"
-);
-param!(
-    VMRankerSendHeadWeights,
-    bool,
-    "rust_home_mixer_vm_ranker_send_head_weights",
-    false
+    "rust_home_mixer_phoenix_experiment_overrides",
+    ""
 );
 param!(
     VMRankerDppTheta,
@@ -709,7 +709,7 @@ param!(
     ColdStartTsTopK,
     u32,
     "rust_home_mixer_cold_start_ts_top_k",
-    5
+    2
 );
 param!(
     ColdStartImpressionScale,
@@ -915,7 +915,14 @@ param!(
     AdsBlenderType,
     String,
     "rust_home_mixer_ads_blender",
-    "partition_organic_low_risk"
+    "multi_risk"
+);
+
+param!(
+    EnableAdsBrandSafetyVerdictV2,
+    bool,
+    "rust_home_mixer_ads_bs_v2_exp_enabled",
+    true
 );
 param!(
     AdsTimeGapTSec,
@@ -1010,6 +1017,13 @@ param!(
     EnableTopicFeedbackContext,
     bool,
     "rust_home_mixer_enable_topic_feedback_context",
+    false
+);
+
+param!(
+    EnableAiTrendFeedbackContext,
+    bool,
+    "rust_home_mixer_enable_ai_trend_feedback_context",
     false
 );
 

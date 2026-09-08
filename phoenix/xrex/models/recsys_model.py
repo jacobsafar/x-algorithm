@@ -21,11 +21,22 @@ from xai_proto import recsys_pb2
 from xrex.data.recsys.constants import (
     CLICK_ACTION_INDEX,
     CLICK_CONDITIONED_ACTION_INDICES,
+    MACT_IN_APP_LOSS_ACTION_INDICES,
     NEGATIVE_FEEDBACK_HEAD_INDICES,
+    SEARCH_RELEVANCE_ACTION_INDICES,
+    SOURCE_SPLIT_CONVERSION_HEAD_INDICES,
+    VIEW_THROUGH_ACTION_INDICES,
     action_type_map,
     engagement_to_ids,
 )
-from xrex.data.recsys.feature_config import ENGAGEMENT_COUNT_BUCKET_MAP, CategoricalFeature
+from xrex.data.recsys.feature_config import (
+    ADS_PRODUCT_KEY_TABLE_SIZE,
+    ENGAGEMENT_COUNT_BUCKET_MAP,
+    BoolFeature,
+    CategoricalFeature,
+    Int64Feature,
+)
+from xrex.data.recsys.grassy_contract import validate_grassy_model_contract
 from xrex.data.recsys.observability import (
     GRASSY_CONTINUOUS_PADDING_HEADS,
     GRASSY_DISCRETE_PADDING_HEADS,
@@ -54,6 +65,7 @@ from xrex.models.recsys_feature_prep import (
     FeaturePrepConfig,
     build_feature_prep_inputs,
 )
+from xrex.models.recsys_sid import reconstruct_entity_sid
 from xrex.models.recsys_user_features import (
     UserFeaturesConfig,
     build_user_feature_parts,
@@ -94,6 +106,11 @@ ANDROID_CLIENT_APP_IDS = (
     5778172,
 )
 
+
+_DPA_PRODUCT_KEY_SLOTS: list[int] = [
+    Int64Feature.firstDpaProductKey.value,
+    Int64Feature.firstDpaProductKeyHash2.value,
+]
 
 POST_AGE_MAX_MINUTES = 4800
 
@@ -499,6 +516,9 @@ class RecsysAggregatedModelConfig(Config):
     # Legacy X batches omit observability masks and retain all-heads-observed
     # semantics. Grassy training must enable this fail-closed gate.
     require_label_observation_masks: bool = False
+    grassy_feature_policy: str | None = None
+    grassy_candidate_age_policy: str | None = None
+    grassy_post_age_encoding: str | None = None
 
     num_continuous_actions: int = 8
 
@@ -532,6 +552,7 @@ class RecsysAggregatedModelConfig(Config):
     effective_sequence_len: int | None = None
 
     transformer_output_only: bool = False
+    use_dense_action_table: bool = False
     use_product_surface: bool = False
 
     post_age_granularity_mins: int = 60
@@ -546,6 +567,8 @@ class RecsysAggregatedModelConfig(Config):
 
     metric_group: str = "default"
 
+    metric_mask_keys: list[str] | None = None
+
     multimodal_embedding_type: EmbeddingType | None = None
 
     search_query_embedding_dim: int = 0
@@ -557,6 +580,9 @@ class RecsysAggregatedModelConfig(Config):
     sid_codebook_size: int = 1024
     sid_hash_level: bool = False
     sid_cross_attn: bool = False
+
+    sid_embedding_mode: Literal["learned", "recon"] = "learned"
+    sid_decoder_path: str = ""
 
     use_user_embedding: bool = True
 
@@ -571,7 +597,21 @@ class RecsysAggregatedModelConfig(Config):
 
     condition_conversion_on_click: bool = False
 
+    train_view_through_heads: bool = False
+
+    split_head_training_by_source: bool = False
+
+    mact_in_app_loss_weight: float = 1.0
+
+    condition_search_relevance_on_prompt: bool = False
+
     enable_platform_metrics: bool = False
+
+    dpa_product_embed_dim: int = 32
+
+    dpa_product_table_size: int = ADS_PRODUCT_KEY_TABLE_SIZE
+
+    enable_dpa_input_embedding: bool = False
 
     user_features: UserFeaturesConfig = UserFeaturesConfig()
 
@@ -592,6 +632,7 @@ class RecsysAggregatedModelConfig(Config):
         return EMBEDDING_CONFIG[self.multimodal_embedding_type][1]
 
     def make(self, sharding_context: ShardingContext) -> RecsysAggregatedModel:
+        validate_grassy_model_contract(self)
         if self.feature_prep_enabled:
             fp = self.feature_prep
             for name, fp_val, parent_val in (
@@ -616,6 +657,20 @@ class RecsysAggregatedModelConfig(Config):
                     "build feature_prep via _make_feature_prep_config or set them consistently."
                 )
 
+        if self.sid_embedding_mode == "recon":
+            assert not self.feature_prep_enabled, (
+                "sid_embedding_mode='recon' is only implemented on the legacy build_inputs "
+                "path; the feature_prep path embeds SIDs via its own learned tables "
+                "(FeaturePrepConfig.enable_post_sid) and would silently ignore recon."
+            )
+            assert not self.sid_hash_level and not self.sid_cross_attn, (
+                "sid_embedding_mode='recon' replaces the learned SID tables outright; "
+                "sid_hash_level / sid_cross_attn only apply to mode='learned'."
+            )
+            assert self.sid_decoder_path, (
+                "sid_embedding_mode='recon' requires sid_decoder_path "
+                "(codebook.safetensors with `stages` + `dec_*` tensors)."
+            )
         if self.use_seqpack:
             attn_config = self.model_config.attn_config
             assert self.right_anchored_rope
@@ -1151,10 +1206,12 @@ def pad_to_next_128_multiple(
     client_app_id: jax.Array | None = None,
     line_item_objective: jax.Array | None = None,
     safety_label_mask: jax.Array | None = None,
+    dpa_product_key: jax.Array | None = None,
 ) -> tuple[
     jax.Array,
     jax.Array,
     jax.Array,
+    jax.Array | None,
     jax.Array | None,
     jax.Array | None,
     jax.Array | None,
@@ -1234,6 +1291,14 @@ def pad_to_next_128_multiple(
     else:
         padded_safety_label_mask = None
 
+    if dpa_product_key is not None:
+        pad_dpa_product_key = jnp.zeros(
+            (batch_size, pad_length) + dpa_product_key.shape[2:], dtype=dpa_product_key.dtype
+        )
+        padded_dpa_product_key = jnp.concatenate([dpa_product_key, pad_dpa_product_key], axis=1)
+    else:
+        padded_dpa_product_key = None
+
     return (
         padded_embeddings,
         padded_mask,
@@ -1246,6 +1311,7 @@ def pad_to_next_128_multiple(
         padded_client_app_id,
         padded_line_item_objective,
         padded_safety_label_mask,
+        padded_dpa_product_key,
     )
 
 
@@ -1303,9 +1369,14 @@ def build_metric_masks(
     new_user_mask: jax.Array | None = None,
     line_item_objective: jax.Array | None = None,
     no_history_mask: jax.Array | None = None,
+    dpa_product_key: jax.Array | None = None,
+    delayed_sample_mask: jax.Array | None = None,
     *,
     condition_conversion_on_click: bool = False,
+    condition_search_relevance_on_prompt: bool = False,
     enable_platform_metrics: bool = False,
+    split_head_training_by_source: bool = False,
+    metric_mask_keys: list[str] | None = None,
 ) -> dict[str, jax.Array]:
     promoted_mask = mask * (promoted_ids != 0) if promoted_ids is not None else jnp.zeros_like(mask)
 
@@ -1381,16 +1452,57 @@ def build_metric_masks(
         non_negative_mask * promoted_mask * home_timeline_mask * website_clicks_objective
     )
 
+    dpa_mask = (
+        (dpa_product_key != 0).astype(mask.dtype)
+        if dpa_product_key is not None
+        else jnp.zeros_like(mask)
+    )
+    masks["dpa"] = mask * dpa_mask
+    masks["non_negative_dpa"] = non_negative_mask * dpa_mask
+
     if condition_conversion_on_click:
         click_mask = raw_targets[:, :, CLICK_ACTION_INDEX].astype(mask.dtype)
         masks["clicked"] = mask * click_mask
         masks["non_negative_clicked"] = mask * (1 - negative_sample_mask) * click_mask
+
+    if split_head_training_by_source:
+        assert condition_conversion_on_click, (
+            "split_head_training_by_source metric slices require condition_conversion_on_click"
+        )
+        delayed = (
+            jnp.zeros_like(mask)
+            if delayed_sample_mask is None
+            else delayed_sample_mask.astype(mask.dtype)
+        )
+        click_mask = raw_targets[:, :, CLICK_ACTION_INDEX].astype(mask.dtype)
+        masks["fresh"] = mask * (1 - delayed)
+        masks["delayed_clicked"] = mask * delayed * click_mask
+        masks["delayed_non_clicked"] = mask * delayed * (1 - click_mask)
+        masks["fresh_home_website_clicks"] = (
+            masks["fresh"] * home_timeline_mask * website_clicks_objective
+        )
+
+    if condition_search_relevance_on_prompt:
+        prompt_mask = jnp.any(
+            raw_targets[:, :, jnp.array(SEARCH_RELEVANCE_ACTION_INDICES)] == 1, axis=-1
+        ).astype(mask.dtype)
+        masks["prompted"] = mask * prompt_mask
+        masks["non_negative_prompted"] = non_negative_mask * prompt_mask
 
     if enable_platform_metrics and ios_mask is not None and android_mask is not None:
         masks["ios"] = ios_mask
         masks["android"] = android_mask
         masks["ios_non_negative"] = ios_mask * (1 - negative_sample_mask)
         masks["android_non_negative"] = android_mask * (1 - negative_sample_mask)
+
+    if metric_mask_keys:
+        keep = set(metric_mask_keys)
+        unknown = keep - masks.keys()
+        if unknown:
+            raise ValueError(
+                f"metric_mask_keys entries {sorted(unknown)} not in available masks {sorted(masks)}"
+            )
+        masks = {k: v for k, v in masks.items() if k in keep}
 
     return masks
 
@@ -1485,7 +1597,12 @@ class RecsysAggregatedModel(hk.Module):
                     pos_sum = stats[f"{eng_name}_{mask_key}_num_tokens"]
                     batch_stat = jnp.stack([ce_sum, pos_sum, total_count])
 
-                    old = jnp.stack([rce_ema[f"{base_key}/{ws}"] for ws in smoothing_windows])
+                    old = jnp.stack(
+                        [
+                            rce_ema.get(f"{base_key}/{ws}", jnp.zeros((3,), dtype=jnp.float32))
+                            for ws in smoothing_windows
+                        ]
+                    )
                     raw_updated = (1.0 - a) * old + a * batch_stat[None, :]
                     updated = jnp.where(
                         jnp.isnan(raw_updated),
@@ -1523,7 +1640,12 @@ class RecsysAggregatedModel(hk.Module):
                     pos_sum_batch = jnp.sum(y * mask_val)
                     batch_stat = jnp.stack([pred_sum, pos_sum_batch])
 
-                    old = jnp.stack([calib_ema[f"{base_key}/{ws}"] for ws in smoothing_windows])
+                    old = jnp.stack(
+                        [
+                            calib_ema.get(f"{base_key}/{ws}", jnp.zeros((2,), dtype=jnp.float32))
+                            for ws in smoothing_windows
+                        ]
+                    )
                     raw_updated = (1.0 - a) * old + a * batch_stat[None, :]
                     updated = jnp.where(
                         jnp.isnan(raw_updated),
@@ -1618,6 +1740,8 @@ class RecsysAggregatedModel(hk.Module):
         new_user_mask: jax.Array | None = None,
         line_item_objective: jax.Array | None = None,
         no_history_mask: jax.Array | None = None,
+        dpa_product_key: jax.Array | None = None,
+        delayed_sample_mask: jax.Array | None = None,
     ) -> dict[str, jax.Array]:
         return build_metric_masks(
             mask,
@@ -1629,8 +1753,13 @@ class RecsysAggregatedModel(hk.Module):
             new_user_mask,
             line_item_objective,
             no_history_mask,
+            dpa_product_key,
+            delayed_sample_mask,
             condition_conversion_on_click=self.config.condition_conversion_on_click,
+            condition_search_relevance_on_prompt=self.config.condition_search_relevance_on_prompt,
             enable_platform_metrics=self.config.enable_platform_metrics,
+            split_head_training_by_source=self.config.split_head_training_by_source,
+            metric_mask_keys=self.config.metric_mask_keys,
         )
 
     def compute_recsys_metrics(
@@ -1645,6 +1774,8 @@ class RecsysAggregatedModel(hk.Module):
         new_user_mask: jax.Array | None = None,
         line_item_objective: jax.Array | None = None,
         no_history_mask: jax.Array | None = None,
+        dpa_product_key: jax.Array | None = None,
+        delayed_sample_mask: jax.Array | None = None,
         stats: dict | None = None,
         rce_ema: dict[str, jax.Array] | None = None,
         rce_alpha: jax.Array | None = None,
@@ -1666,6 +1797,8 @@ class RecsysAggregatedModel(hk.Module):
             new_user_mask,
             line_item_objective,
             no_history_mask,
+            dpa_product_key,
+            delayed_sample_mask,
         )
 
         return self._compute_metrics_after_masks(
@@ -1737,29 +1870,114 @@ class RecsysAggregatedModel(hk.Module):
     ) -> dict:
         if stats is None:
             stats = {}
-        ctx_config = self.config.context_features
-        if not ctx_config.enabled or not ctx_config.enable_engagement_counts or batch is None:
+        fp_on = (
+            self.config.feature_prep_enabled and self.config.feature_prep.enable_engagement_counts
+        )
+        ctx_on = (
+            self.config.context_features.enabled
+            and self.config.context_features.enable_engagement_counts
+        )
+        stale_on = self.config.feature_prep_enabled and self.config.feature_prep.enable_stale_post
+        if batch is None or not (fp_on or ctx_on or stale_on):
             return stats
 
-        for cat_feat_enum, int64_feat_enum in ENGAGEMENT_COUNT_BUCKET_MAP:
-            name = cat_feat_enum.name.removesuffix("CountBucketSeq").lower()
-            max_bucket = ENGAGEMENT_COUNT_MAX_BUCKET.get(
-                cat_feat_enum, ENGAGEMENT_COUNT_NUM_BUCKETS - 1
-            )
-            for seq_name, side in (("history_seq", "history"), ("candidate_seq", "candidate")):
-                seq = batch[seq_name]
-                raw_i64 = seq.get("int64_features")
-                post_hashes = seq.get("post_hashes")
-                if raw_i64 is None or post_hashes is None:
-                    continue
-                raw_counts = cast_jax(raw_i64)[:, :, int64_feat_enum.value]
+        def _add_scalar_stats(
+            name: str,
+            side: str,
+            raw_counts: jax.Array,
+            valid_float: jax.Array,
+        ) -> None:
+            raw_non_negative = jnp.maximum(raw_counts.astype(jnp.float32), 0.0)
+            log2_counts = jnp.log2(raw_non_negative + 1.0)
+            n_valid = jnp.maximum(jnp.sum(valid_float), 1.0)
+            positive = (raw_non_negative > 0.0).astype(jnp.float32)
+
+            stats[f"ec/{name}/{side}/coverage"] = jnp.sum(positive * valid_float) / n_valid
+            stats[f"ec/{name}/{side}/mean_raw"] = jnp.sum(raw_non_negative * valid_float) / n_valid
+            stats[f"ec/{name}/{side}/mean_log2"] = jnp.sum(log2_counts * valid_float) / n_valid
+
+        def _add_bucket_percentiles(
+            name: str,
+            side: str,
+            bucket_values: jax.Array,
+            valid_float: jax.Array,
+            nbins: int,
+        ) -> None:
+            n_valid = jnp.maximum(jnp.sum(valid_float), 1.0)
+            binned = jnp.clip(bucket_values.astype(jnp.int32), 0, nbins - 1)
+            hist = (
+                jnp.zeros((nbins,), jnp.float32)
+                .at[jnp.reshape(binned, (-1,))]
+                .add(jnp.reshape(valid_float, (-1,)))
+            ) / n_valid
+            cdf = jnp.cumsum(hist)
+            for q_name, q in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99)):
+                stats[f"ec/{name}/{side}/{q_name}_bucket"] = jnp.argmax(cdf >= q).astype(
+                    jnp.float32
+                )
+
+        for seq_name, side in (("history_seq", "history"), ("candidate_seq", "candidate")):
+            seq = batch[seq_name]
+            raw_i64 = seq.get("int64_features")
+            post_hashes = seq.get("post_hashes")
+            if raw_i64 is None or post_hashes is None:
+                continue
+
+            i64 = cast_jax(raw_i64)
+            valid = (cast_jax(post_hashes)[..., 0] > 0).astype(jnp.float32)
+            n_valid = jnp.maximum(jnp.sum(valid), 1.0)
+            raw_by_name: dict[str, jax.Array] = {}
+
+            for cat_feat_enum, int64_feat_enum in ENGAGEMENT_COUNT_BUCKET_MAP:
+                name = cat_feat_enum.name.removesuffix("CountBucketSeq").lower()
+                max_bucket = ENGAGEMENT_COUNT_MAX_BUCKET.get(
+                    cat_feat_enum, ENGAGEMENT_COUNT_NUM_BUCKETS - 1
+                )
+                raw_counts = i64[:, :, int64_feat_enum.value]
+                raw_by_name[name] = jnp.maximum(raw_counts.astype(jnp.float32), 0.0)
                 buckets = compute_engagement_count_bucket(raw_counts, max_bucket)
-                valid = (cast_jax(post_hashes)[..., 0] > 0).astype(jnp.float32)
-                n_valid = jnp.maximum(jnp.sum(valid), 1.0)
-                coverage = jnp.sum((buckets > 0).astype(jnp.float32) * valid) / n_valid
-                mean_bucket = jnp.sum(buckets.astype(jnp.float32) * valid) / n_valid
-                stats[f"ec/{name}/{side}/coverage"] = coverage
-                stats[f"ec/{name}/{side}/mean_bucket"] = mean_bucket
+
+                _add_scalar_stats(name, side, raw_counts, valid)
+                stats[f"ec/{name}/{side}/mean_bucket"] = (
+                    jnp.sum(buckets.astype(jnp.float32) * valid) / n_valid
+                )
+                _add_bucket_percentiles(name, side, buckets, valid, max_bucket + 1)
+
+            non_view_engagement = (
+                raw_by_name["fav"]
+                + raw_by_name["reply"]
+                + raw_by_name["repost"]
+                + raw_by_name["quote"]
+            )
+            view = raw_by_name["view"]
+            _add_scalar_stats("engagement_no_view", side, non_view_engagement, valid)
+            _add_bucket_percentiles(
+                "engagement_no_view",
+                side,
+                compute_engagement_count_bucket(
+                    non_view_engagement, ENGAGEMENT_COUNT_NUM_BUCKETS - 1
+                ),
+                valid,
+                ENGAGEMENT_COUNT_NUM_BUCKETS,
+            )
+
+            view_missing_like = ((view <= 0.0) & (non_view_engagement > 0.0)).astype(jnp.float32)
+            stats[f"ec/view/{side}/missing_like_rate"] = (
+                jnp.sum(view_missing_like * valid) / n_valid
+            )
+
+            bools = seq.get("bool_features")
+            if (
+                side == "candidate"
+                and stale_on
+                and bools is not None
+                and bools.shape[-1] > BoolFeature.isStalePost14d.value
+            ):
+                is_stale = cast_jax(bools)[:, :, BoolFeature.isStalePost14d.value].astype(
+                    jnp.float32
+                )
+                stats[f"ec/stale_post_14d/{side}/zeroed_frac"] = jnp.sum(is_stale * valid) / n_valid
+
         return stats
 
     def compute_author_nsfw_metrics(
@@ -1803,8 +2021,21 @@ class RecsysAggregatedModel(hk.Module):
         emb_size: int,
         embed_init_scale: float,
         name: str,
+        dense: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         embed_init = hk.initializers.VarianceScaling(embed_init_scale, mode="fan_out")
+        if dense:
+            embedding_table = get_parameter(
+                name,
+                shape=[output_vocab_size, emb_size],
+                init=embed_init,
+                dtype=jnp.float32,
+                pspec=P(),
+                rms_clip_axes=(-2, -1),
+            )
+            output = jnp.dot(input.astype(embedding_table.dtype), embedding_table)
+            output = output.astype(DTYPE_BY_NAME[self.config.fprop_dtype])
+            return output, embedding_table
         embedding_table = get_parameter(
             name,
             shape=[
@@ -2033,6 +2264,19 @@ class RecsysAggregatedModel(hk.Module):
         return unembed_mat
 
     @hk.transparent
+    def _get_dpa_product_embedding_table(self) -> jax.Array:
+        _config = self.config
+        dim = _config.dpa_product_embed_dim
+        return get_parameter(
+            "dpa_product_embedding_table",
+            [_config.dpa_product_table_size, dim],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(),
+            rms_clip_axes=(-2, -1),
+        )
+
+    @hk.transparent
     def decode(self, inputs: jax.Array) -> jax.Array:
         unembeddings = self._get_unembedding()
         return jnp.dot(inputs.astype(unembeddings.dtype), unembeddings).astype(inputs.dtype)
@@ -2193,6 +2437,41 @@ class RecsysAggregatedModel(hk.Module):
             return user_embeddings, user_padding_mask
 
     @hk.transparent
+    def _maybe_add_dpa_input_embedding(
+        self,
+        candidate_embeddings: jax.Array,
+        recsys_features_batch: RecsysFeaturesBatch,
+    ) -> jax.Array:
+        _config = self.config
+        if not _config.enable_dpa_input_embedding:
+            return candidate_embeddings
+        table = self._get_dpa_product_embedding_table()
+        dpa_dim = _config.dpa_product_embed_dim
+        embed_init = hk.initializers.VarianceScaling(_config.embed_init_scale, mode="fan_out")
+        proj = get_parameter(
+            "dpa_input_proj",
+            [dpa_dim, _config.emb_table_width],
+            dtype=jnp.float32,
+            init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
+            pspec=P(None, None),
+            lr_multiplier=_config.model_config.scale_config.emb_lr_multiplier(dpa_dim),
+        )
+        raw_i64 = recsys_features_batch["candidate_seq"].get("int64_features")
+        if raw_i64 is None:
+            return candidate_embeddings
+        keys = cast_jax(raw_i64)[:, :, _DPA_PRODUCT_KEY_SLOTS].astype(jnp.int32)
+        assert keys.shape[:2] == candidate_embeddings.shape[:2], (
+            f"dpa keys shape {keys.shape} must match candidate embeddings "
+            f"{candidate_embeddings.shape[:2]}"
+        )
+        valid = keys != 0
+        ids = jnp.where(valid, jnp.clip(keys, 1, _config.dpa_product_table_size - 1), 0)
+        rows = jnp.take(table, ids, axis=0)
+        product_emb = jnp.where(valid[..., None], rows, 0.0).sum(axis=2)
+        emb = jnp.dot(product_emb.astype(proj.dtype), proj)
+        return candidate_embeddings + emb.astype(candidate_embeddings.dtype)
+
+    @hk.transparent
     def build_inputs(
         self,
         recsys_features_batch: RecsysFeaturesBatch,
@@ -2203,6 +2482,9 @@ class RecsysAggregatedModel(hk.Module):
         assert _config.model_config.output_vocab_size is not None, "output_vocab_size is required"
 
         if _config.feature_prep_enabled:
+            assert not _config.enable_dpa_input_embedding, (
+                "enable_dpa_input_embedding is not implemented for the feature_prep path"
+            )
             fp = _config.feature_prep
             scale_multiplier = fp.scale_config.input_scale(fp.emb_size)
             tokens, padding_mask, candidate_start_offset = build_feature_prep_inputs(
@@ -2272,8 +2554,9 @@ class RecsysAggregatedModel(hk.Module):
             ca = cast_jax(history_continuous_actions)
             if ca.shape[-1] > 1:
                 history_dwell_time = ca[:, :, 1]
-            if _config.concat_history_bridge_prob and ca.shape[-1] > 0:
-                history_bridge_prob = ca[:, :, 0]
+            _bridge_idx = recsys_pb2.ContinuousActionName.BRIDGE_PROBABILITY
+            if _config.concat_history_bridge_prob and ca.shape[-1] > _bridge_idx:
+                history_bridge_prob = ca[:, :, _bridge_idx]
 
         if ctx_config.enable_engagement_counts:
             for cat_feat_enum, int64_feat_enum in ENGAGEMENT_COUNT_BUCKET_MAP:
@@ -2329,6 +2612,7 @@ class RecsysAggregatedModel(hk.Module):
             _config.emb_table_width,
             _config.embed_init_scale,
             "action_embedding_table",
+            dense=_config.use_dense_action_table,
         )
         multimodal_embeddings: jax.Array | None = None
 
@@ -2414,6 +2698,9 @@ class RecsysAggregatedModel(hk.Module):
                 candidate_search_query_embeddings=candidate_search_query_embeddings,
                 search_query_embedding_dim=self.config.search_query_embedding_dim,
                 fprop_dtype=DTYPE_BY_NAME[self.config.fprop_dtype],
+            )
+            candidate_embeddings = self._maybe_add_dpa_input_embedding(
+                candidate_embeddings, recsys_features_batch
             )
 
             user_features_token = None
@@ -2503,6 +2790,16 @@ class RecsysAggregatedModel(hk.Module):
                     )
                 else:
                     sids_jax = cast_jax(sids_in)
+                if _config.sid_embedding_mode == "recon":
+                    return reconstruct_entity_sid(
+                        sids_jax,
+                        _config.emb_table_width,
+                        _config.sid_decoder_path,
+                        self.config.model_config.scale_config.emb_lr_multiplier,
+                        self.config.embed_init_scale,
+                        DTYPE_BY_NAME[_config.fprop_dtype],
+                        "post",
+                    )
                 needs_hashes = _config.sid_hash_level
                 return embed_entity_sid(
                     sids_jax,
@@ -2521,6 +2818,7 @@ class RecsysAggregatedModel(hk.Module):
 
             _sid_post_emb_h = _embed_post_sid("history_seq") if _config.use_post_sid else None
             _sid_post_emb_c = _embed_post_sid("candidate_seq") if _config.use_post_sid else None
+            _sid_recon = _config.use_post_sid and _config.sid_embedding_mode == "recon"
 
             history_embeddings, history_padding_mask = block_history_reduce(
                 history_post_hashes,
@@ -2533,9 +2831,11 @@ class RecsysAggregatedModel(hk.Module):
                 self.config.model_config.scale_config.emb_lr_multiplier,
                 self.config.embed_init_scale,
                 history_unified_context is not None,
-                sid_post_embeddings=_sid_post_emb_h,
+                sid_post_embeddings=None if _sid_recon else _sid_post_emb_h,
                 history_bridge_prob=history_bridge_prob,
             )
+            if _sid_recon and _sid_post_emb_h is not None:
+                history_embeddings += _sid_post_emb_h.astype(history_embeddings.dtype)
 
             if (
                 self.config.safety_filter_mode == "hard"
@@ -2565,7 +2865,12 @@ class RecsysAggregatedModel(hk.Module):
                 candidate_search_query_embeddings=candidate_search_query_embeddings,
                 search_query_embedding_dim=self.config.search_query_embedding_dim,
                 fprop_dtype=DTYPE_BY_NAME[self.config.fprop_dtype],
-                sid_post_embeddings=_sid_post_emb_c,
+                sid_post_embeddings=None if _sid_recon else _sid_post_emb_c,
+            )
+            if _sid_recon and _sid_post_emb_c is not None:
+                candidate_embeddings += _sid_post_emb_c.astype(candidate_embeddings.dtype)
+            candidate_embeddings = self._maybe_add_dpa_input_embedding(
+                candidate_embeddings, recsys_features_batch
             )
 
             if _config.user_features.has_user_features:
@@ -2758,6 +3063,12 @@ class RecsysAggregatedModel(hk.Module):
         line_item_objective = (
             cast_jax(raw_line_item_objective) if raw_line_item_objective is not None else None
         )
+        raw_candidate_int64 = batch["candidate_seq"].get("int64_features")
+        dpa_product_key = (
+            cast_jax(raw_candidate_int64)[:, :, _DPA_PRODUCT_KEY_SLOTS]
+            if raw_candidate_int64 is not None
+            else None
+        )
         candidate_safety_mask = (
             cast_jax(candidate_safety_mask) if candidate_safety_mask is not None else None
         )
@@ -2784,6 +3095,23 @@ class RecsysAggregatedModel(hk.Module):
                 )
             else:
                 raw_weights = jnp.broadcast_to(sample_weights, targets.shape[:2])
+
+        delayed_mask: jax.Array | None = None
+        sample_source = batch.get("sample_source")
+        if sample_source is not None:
+            sample_source = cast_jax(sample_source).astype(jnp.float32)
+            if self.config.use_seqpack:
+                delayed_mask = jnp.repeat(
+                    sample_source.squeeze(-1), packed_candidate_seq_len, axis=1
+                )
+            else:
+                delayed_mask = sample_source
+        if self.config.split_head_training_by_source:
+            assert delayed_mask is not None, (
+                "split_head_training_by_source=True requires the sample_source batch "
+                "field (from the is_delayed_feedback column); training unsplit "
+                "silently would defeat the flag"
+            )
 
         if self.config.log_q_correction:
             tweet_counts = get_candidate_tweet_counts(
@@ -2870,6 +3198,7 @@ class RecsysAggregatedModel(hk.Module):
                 client_app_id,
                 line_item_objective,
                 candidate_safety_mask,
+                dpa_product_key,
             ) = pad_to_next_128_multiple(
                 input_embeddings,
                 padding_mask,
@@ -2882,6 +3211,7 @@ class RecsysAggregatedModel(hk.Module):
                 client_app_id,
                 line_item_objective,
                 candidate_safety_mask,
+                dpa_product_key,
             )
             action_observation_mask = pad_observation_mask(
                 action_observation_mask,
@@ -2937,6 +3267,11 @@ class RecsysAggregatedModel(hk.Module):
                 )
 
             target_padding_mask = padding_mask[:, candidate_start_offset:]
+            trained_candidate_mask = batch["candidate_seq"].get("trained_candidate_mask")
+            if trained_candidate_mask is not None:
+                keep = cast_jax(trained_candidate_mask)
+                pad_len = target_padding_mask.shape[1] - keep.shape[1]
+                target_padding_mask = target_padding_mask & jnp.pad(keep, ((0, 0), (0, pad_len)))
 
             history_padding = padding_mask[
                 :,
@@ -3005,6 +3340,39 @@ class RecsysAggregatedModel(hk.Module):
             conv_zero_mask = no_click[:, :, None] * conv_head_mask
             loss_mask = loss_mask * (1 - conv_zero_mask)
 
+        vt_head_mask = jnp.zeros(num_actions).at[jnp.array(VIEW_THROUGH_ACTION_INDICES)].set(1.0)
+        if self.config.train_view_through_heads:
+            vt_zero = targets[:, :, CLICK_ACTION_INDEX][:, :, None] * vt_head_mask
+        else:
+            vt_zero = vt_head_mask
+        loss_mask = loss_mask * (1 - vt_zero)
+
+        if self.config.mact_in_app_loss_weight != 1.0:
+            mact_w = (
+                jnp.ones(num_actions)
+                .at[jnp.array(MACT_IN_APP_LOSS_ACTION_INDICES)]
+                .set(self.config.mact_in_app_loss_weight)
+            )
+            loss_mask = loss_mask * mact_w
+
+        if self.config.condition_search_relevance_on_prompt:
+            prompt_shown = jnp.any(targets[:, :, SEARCH_RELEVANCE_ACTION_INDICES], axis=-1)
+            no_prompt = 1 - prompt_shown
+            search_head_mask = (
+                jnp.zeros(num_actions).at[jnp.array(SEARCH_RELEVANCE_ACTION_INDICES)].set(1.0)
+            )
+            search_zero_mask = no_prompt[:, :, None] * search_head_mask
+            loss_mask = loss_mask * (1 - search_zero_mask)
+
+        if self.config.split_head_training_by_source and delayed_mask is not None:
+            conv_head_split_mask = (
+                jnp.zeros(num_actions).at[jnp.array(SOURCE_SPLIT_CONVERSION_HEAD_INDICES)].set(1.0)
+            )
+            eng_head_mask = 1.0 - conv_head_split_mask
+            is_delayed = delayed_mask[:, :, None]
+            loss_mask = loss_mask * (1 - is_delayed * eng_head_mask)
+            loss_mask = loss_mask * (1 - (1 - is_delayed) * conv_head_split_mask)
+
         safety_stats = safety_filter_stats(
             candidate_safety_mask,
             target_padding_mask,
@@ -3039,6 +3407,7 @@ class RecsysAggregatedModel(hk.Module):
             1.0 if self.config.safety_filter_mode != "off" else 0.0
         )
         stats["origin-loss"] = loss
+        stats["mact-in-app-loss-weight"] = jnp.float32(self.config.mact_in_app_loss_weight)
 
         stats = self.compute_recsys_metrics(
             raw_targets=targets,
@@ -3051,6 +3420,8 @@ class RecsysAggregatedModel(hk.Module):
             new_user_mask=new_user_mask,
             line_item_objective=line_item_objective,
             no_history_mask=no_history_mask,
+            dpa_product_key=dpa_product_key[..., 0] if dpa_product_key is not None else None,
+            delayed_sample_mask=delayed_mask,
             stats=stats,
             rce_ema=rce_ema,
             rce_alpha=rce_alpha,
@@ -3087,14 +3458,22 @@ class RecsysAggregatedModel(hk.Module):
                 product_surface=product_surface,
                 new_user_mask=new_user_mask,
                 no_history_mask=no_history_mask,
+                dpa_product_key=dpa_product_key[..., 0] if dpa_product_key is not None else None,
+                delayed_sample_mask=delayed_mask,
             )
+
+            continuous_base_mask = target_padding_mask
+            if self.config.split_head_training_by_source and delayed_mask is not None:
+                continuous_base_mask = continuous_base_mask * (
+                    1 - delayed_mask.astype(continuous_base_mask.dtype)
+                )
 
             for loss_config in self.config.continuous_action_losses:
                 if loss_config.loss_weight > 0 and loss_config.action_index < data_num_continuous:
                     gt_raw = candidate_continuous_actions[:, :, loss_config.action_index]
                     pred_raw = candidate_continuous_preds[:, :, loss_config.action_index]
 
-                    head_valid_mask = target_padding_mask
+                    head_valid_mask = continuous_base_mask
                     if continuous_action_observation_mask is not None:
                         head_valid_mask = head_valid_mask * continuous_action_observation_mask[
                             :, :, loss_config.action_index

@@ -2,12 +2,14 @@ use crate::clients::socialgraph_client::ProdSocialgraphClient;
 use crate::filter::{FilterRequest, FilterResponse, FilterTweets};
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
-use crate::hydration::{FallbackCacheMode, HydrationPipeline};
+use crate::hydration::HydrationPipeline;
 use crate::models::{RawCandidate, TweetId};
+use crate::reference_compare::ReferenceCompareHarness;
 use crate::rules::{SafetyLevel, Verdict};
 use crate::safety_label_source::lookup::RemoteSource;
 use crate::safety_label_source::manhattan::ManhattanSource;
 use crate::safety_label_source::twemcache::TwemcacheSource;
+use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher, Warmer};
 use crate::safety_label_source::{ManhattanLabelFetcher, MhLabelClient, SafetyLabelSource};
 use crate::server::VFServer;
 use std::future::Future;
@@ -18,6 +20,7 @@ use xai_core_entities::gizmoduck_client::{GizmoduckClientConfig, ProdGizmoduckCl
 use xai_core_entities::rpc_constants::{GizmoduckRpcConstants, RpcConstants, TESRpcConstants};
 use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use xai_core_entities::tweet_entity_service_client::{ProdTESClient, TESClientConfig};
+use xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};
 use xai_x_rpc::balanced_channel::LbPolicy;
 
 const CACHE_PATH: &str = "/s/cache/safety_label_store:twemcaches";
@@ -82,27 +85,22 @@ where
     }
 }
 
-pub async fn build_prod_server(datacenter: &str) -> VFServer {
+#[expect(
+    clippy::expect_used,
+    reason = "startup fail-fast: init failure is fatal"
+)]
+pub async fn build_prod_server(
+    datacenter: &str,
+    feature_switches: Arc<xai_feature_switches::FeatureSwitches>,
+) -> VFServer {
     info!("Initializing prod clients for datacenter={}", datacenter);
 
     let init_deadline = tokio::time::Instant::now() + CLIENT_INIT_RETRY_BUDGET;
 
     let deterministic_aperture = std::env::var("APP_ENV").as_deref() == Ok("prod");
-    let fallback_cache_serve_stale = crate::config::fallback_cache_serve_stale_enabled();
-    let fallback_cache_mode = if fallback_cache_serve_stale {
-        FallbackCacheMode::ServeStale
-    } else if crate::config::fallback_cache_populate_enabled() {
-        FallbackCacheMode::Shadow
-    } else {
-        FallbackCacheMode::Disabled
-    };
-    let media_fallback_cache_mode = if crate::config::media_fallback_cache_serve_stale_enabled() {
-        FallbackCacheMode::ServeStale
-    } else if crate::config::media_fallback_cache_populate_enabled() {
-        FallbackCacheMode::Shadow
-    } else {
-        FallbackCacheMode::Disabled
-    };
+    let fallback_cache_enabled = crate::config::fallback_cache_enabled();
+    let fallback_cache = fallback_cache_enabled
+        .then(crate::hydration::gizmoduck_hydrator::GizmoduckAuthorHydrator::fallback_cache);
 
     let tes_client: Arc<
         dyn xai_core_entities::tweet_entity_service_client::TESClient + Send + Sync,
@@ -119,10 +117,7 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
         .expect("Failed to initialize TES client"),
     );
 
-    let gizmoduck_client_id = format!(
-        "visibility-filtering-service.{}",
-        std::env::var("APP_ENV").unwrap_or_else(|_| "prod".to_string())
-    );
+    let gizmoduck_client_id = crate::config::gizmoduck_client_id();
     let gizmoduck_client: Arc<
         dyn xai_core_entities::gizmoduck_client::GizmoduckClient + Send + Sync,
     > = Arc::new(
@@ -170,11 +165,12 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
         .expect("Failed to initialize MhLabelClient"),
     );
 
+    let twemcache_client_name = crate::config::twemcache_client_name();
     let twemcache = Arc::new(
         init_client_with_retry("twemcache", init_deadline, || {
             crate::twemcache::TwemcacheClient::new_with_tls_paths(
                 CACHE_PATH,
-                "visibility-filtering-service",
+                twemcache_client_name.clone(),
                 datacenter,
                 &S2S_CHAIN_PATH,
                 &S2S_CRT_PATH,
@@ -190,12 +186,20 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
     );
     info!("Cache client connected to {CACHE_PATH}");
 
+    let reference_compare = build_reference_compare_harness(datacenter, init_deadline).await;
+
     warm_cache(&twemcache).await;
     warm_manhattan(mh_label_client.as_ref()).await;
 
+    let cache_warmer = build_cache_warmer(datacenter, init_deadline).await;
+
     let twemcache_source = Arc::new(TwemcacheSource::new(twemcache));
     let manhattan_source = Arc::new(ManhattanSource::new(mh_label_client));
-    let remote = Arc::new(RemoteSource::new(twemcache_source, manhattan_source));
+    let mut remote = RemoteSource::new(twemcache_source, manhattan_source);
+    if let Some(warmer) = cache_warmer {
+        remote = remote.with_warmer(warmer);
+    }
+    let remote = Arc::new(remote);
     let safety_label_source = Arc::new(SafetyLabelSource::new(remote));
 
     let hydration_pipeline = HydrationPipeline::new(
@@ -203,28 +207,116 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
         gizmoduck_client,
         sg_client,
         safety_label_source.clone(),
-        fallback_cache_mode,
-        media_fallback_cache_mode,
+        fallback_cache,
     );
-    let policies = crate::rules::Policies::new();
-    let (home_rule_count, recommendations_rule_count) = policies.rule_counts();
-    let filter_tweets = FilterTweets::new(hydration_pipeline, policies);
+    let gating_countries = Arc::new(crate::params::NsfwGatingCountries::starting_at_default());
+    let fs_path = crate::config::fs_path();
+    gating_countries.refresh_and_check_drift(&feature_switches, &fs_path);
+    gating_countries.spawn_refresh(feature_switches, fs_path);
+    let rule_engine = crate::rules::RuleEngine::with_nsfw_gating_countries(gating_countries);
+    let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
+    let filter_tweets = FilterTweets::new(hydration_pipeline, rule_engine);
 
     warm_filter_tweets(&filter_tweets).await;
 
     info!(
         hydrator_count = 5,
-        ?fallback_cache_mode,
-        ?media_fallback_cache_mode,
+        fallback_cache_enabled,
         home_rule_count,
         recommendations_rule_count,
         "VFServer initialized with prod clients"
     );
 
     VFServer::from_endpoints(
-        FilterTweetsEndpoint::new(filter_tweets),
+        FilterTweetsEndpoint::new(filter_tweets, reference_compare),
         GetSafetyLabelsEndpoint::new(safety_label_source),
     )
+}
+
+async fn build_reference_compare_harness(
+    datacenter: &str,
+    init_deadline: tokio::time::Instant,
+) -> Option<Arc<ReferenceCompareHarness>> {
+    #[expect(clippy::panic, reason = "startup fail-fast on misconfiguration")]
+    let should_build = crate::reference_compare::should_build_harness(
+        crate::config::dual_call_harness_enabled(),
+        std::env::var("APP_ENV").ok().as_deref(),
+    )
+    .unwrap_or_else(|misconfiguration| panic!("{misconfiguration}"));
+    if !should_build {
+        return None;
+    }
+
+    let client_id = format!(
+        "visibility-filtering-service.{}",
+        std::env::var("APP_ENV").unwrap_or_else(|_| "staging".to_string())
+    );
+    #[expect(
+        clippy::expect_used,
+        reason = "startup fail-fast: init failure is fatal"
+    )]
+    let strato: Arc<dyn VfClient + Send + Sync> = Arc::new(
+        init_client_with_retry("strato_vf", init_deadline, || {
+            let client_id = client_id.clone();
+            async move {
+                StratoVfClient::new(
+                    S2S_CHAIN_PATH.clone(),
+                    S2S_CRT_PATH.clone(),
+                    S2S_KEY_PATH.clone(),
+                    client_id,
+                    datacenter.to_string(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+        })
+        .await
+        .expect("Failed to initialize Strato VF client (reference comparator)"),
+    );
+    Some(Arc::new(ReferenceCompareHarness::new(strato, datacenter)))
+}
+
+const CACHE_WARM_REQUEST_TIMEOUT_MS: u64 = 500;
+
+#[expect(
+    clippy::expect_used,
+    reason = "startup fail-fast: init failure is fatal"
+)]
+async fn build_cache_warmer(
+    datacenter: &str,
+    init_deadline: tokio::time::Instant,
+) -> Option<Arc<dyn Warmer>> {
+    if !crate::config::cache_warm_enabled() {
+        return None;
+    }
+
+    let client_id = format!(
+        "visibility-filtering-service.{}",
+        std::env::var("APP_ENV").unwrap_or_else(|_| "prod".to_string())
+    );
+    let grpc = init_client_with_retry("strato_cache_warm", init_deadline, || {
+        let config = xai_strato::StratoGrpcConfig {
+            ca_cert_path: S2S_CHAIN_PATH.clone(),
+            client_cert_path: S2S_CRT_PATH.clone(),
+            client_key_path: S2S_KEY_PATH.clone(),
+            num_endpoints: Some(12),
+            connect_timeout_ms: 400,
+            request_timeout_ms: CACHE_WARM_REQUEST_TIMEOUT_MS,
+            client_id: Some(client_id.clone()),
+            service_url: format!("stratostore.stratoserver.prod.{datacenter}.s2s.twttr.net"),
+            zone: datacenter.to_string(),
+            ..Default::default()
+        };
+        async move {
+            xai_strato::StratoGrpc::new(config)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .expect("Failed to initialize Strato cache-warm client");
+    info!("L2 cache warmer enabled");
+    Some(CacheWarmer::spawn(Arc::new(StratoWarmFetcher::new(grpc))))
 }
 
 const TES_STRATO_REQUEST_TIMEOUT_MS: u64 = 100;
@@ -241,12 +333,15 @@ fn tes_client_config(deterministic_aperture: bool) -> TESClientConfig {
     }
 }
 
+const GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS: u64 = 80;
+
 fn gizmoduck_client_config(deterministic_aperture: bool) -> GizmoduckClientConfig {
     GizmoduckClientConfig {
         aperture_size: Some(GizmoduckRpcConstants::num_endpoints()),
         deterministic_aperture,
         lb_policy: Some(LbPolicy::least_request()),
         readiness_probe_port: Some(GIZMODUCK_READINESS_PROBE_PORT),
+        request_timeout_ms: Some(GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS),
         ..Default::default()
     }
 }
@@ -354,13 +449,20 @@ async fn warm_manhattan(manhattan: &dyn ManhattanLabelFetcher) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::{FilterOutcome, FilterSummary};
+    use crate::filter::FilterOutcome;
     use crate::models::VfAction;
     use std::cell::Cell;
     use xai_visibility_filtering::models::FilteredReason;
 
     fn deadline_in(budget: Duration) -> tokio::time::Instant {
         tokio::time::Instant::now() + budget
+    }
+
+    #[tokio::test]
+    async fn reference_compare_harness_not_built_without_flag() {
+        let harness =
+            build_reference_compare_harness("atla", deadline_in(Duration::from_secs(1))).await;
+        assert!(harness.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -457,22 +559,7 @@ mod tests {
                 safety_labels: None,
             })
             .collect();
-        FilterResponse {
-            summary: FilterSummary {
-                tweet_count: outcomes.len(),
-                drop_count: outcomes
-                    .iter()
-                    .filter(|outcome| matches!(outcome.verdict.action, VfAction::Drop(_)))
-                    .count(),
-                unresolved_author_count: outcomes
-                    .iter()
-                    .filter(|outcome| {
-                        outcome.verdict.decided_by == Verdict::unresolved_author().decided_by
-                    })
-                    .count(),
-            },
-            outcomes,
-        }
+        FilterResponse { outcomes }
     }
 
     #[test]

@@ -6,8 +6,10 @@ import errno
 import logging
 import os
 import queue
+import re
 import threading
 import time
+import urllib.parse
 from functools import partial
 from threading import Event
 from typing import Any, Iterator, Mapping, Optional, cast
@@ -67,6 +69,70 @@ metrics_server_started = False
 
 _kafka_reset_event: Optional[threading.Event] = None
 
+_kafka_catchup_event: threading.Event = threading.Event()
+_kafka_catchup_window_secs: float = 7200.0
+_kafka_catchup_lock: threading.Lock = threading.Lock()
+_kafka_catchup_generation: int = 0
+
+_CATCHUP_MIN_SECS = 60.0
+_CATCHUP_MAX_SECS = 24.0 * 3600.0
+_CATCHUP_DEFAULT_SECS = 7200.0
+
+_CATCHUP_DURATION_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(s|sec|secs|m|min|mins|h|hr|hrs|hour|hours)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_catchup_duration(raw: str | None) -> float:
+    if raw is None or not raw.strip():
+        return _CATCHUP_DEFAULT_SECS
+    m = _CATCHUP_DURATION_RE.match(raw)
+    if m is None:
+        raise ValueError(
+            f"unparseable duration {raw!r} (examples: '30min', '2hr', '90m', "
+            "'7200s'; a bare number means minutes)"
+        )
+    value = float(m.group(1))
+    unit = (m.group(2) or "m").lower()
+    if unit.startswith("s"):
+        secs = value
+    elif unit.startswith("m"):
+        secs = value * 60.0
+    else:
+        secs = value * 3600.0
+    if not _CATCHUP_MIN_SECS <= secs <= _CATCHUP_MAX_SECS:
+        raise ValueError(
+            f"duration {raw!r} = {secs:.0f}s is outside "
+            f"[{_CATCHUP_MIN_SECS:.0f}s, {_CATCHUP_MAX_SECS:.0f}s] "
+            "(below 1 min use /reset-kafka instead; above 24 h dropping "
+            "is not worth it)"
+        )
+    return secs
+
+
+def _post_catchup_request(window_secs: float) -> None:
+    global _kafka_catchup_window_secs, _kafka_catchup_generation
+    with _kafka_catchup_lock:
+        _kafka_catchup_window_secs = window_secs
+        _kafka_catchup_generation += 1
+        _kafka_catchup_event.set()
+
+
+def _take_catchup_request() -> tuple[int, float] | None:
+    with _kafka_catchup_lock:
+        if _kafka_catchup_event.is_set():
+            _kafka_catchup_event.clear()
+            return _kafka_catchup_generation, _kafka_catchup_window_secs
+    return None
+
+
+def _rearm_catchup_request(generation: int) -> None:
+    with _kafka_catchup_lock:
+        if _kafka_catchup_generation == generation:
+            _kafka_catchup_event.set()
+
+
 _meter = None
 _kafka_batches_processed = None
 _kafka_messages_processed = None
@@ -95,34 +161,72 @@ def _start_reset_http_server(base_port: int, num_ports: int) -> int | None:
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class _ResetHandler(BaseHTTPRequestHandler):
+        timeout = 10
+
+        def _respond(self, status: int, body: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
         def do_POST(self):
-            if self.path == "/reset-kafka":
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/reset-kafka":
                 if _kafka_reset_event is not None:
                     _kafka_reset_event.set()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(b"Kafka reset signal sent\n")
+                    self._respond(200, "Kafka reset signal sent\n")
                     rank_logger.info(
                         "Kafka reset signal received via HTTP POST /reset-kafka on port %d",
                         self.server.server_address[1],
                     )
                 else:
-                    self.send_response(503)
-                    self.send_header("Content-Type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(b"Consumer not started yet\n")
+                    self._respond(503, "Consumer not started yet\n")
+            elif parsed.path == "/catchup-kafka":
+                if _kafka_reset_event is None:
+                    self._respond(503, "Consumer not started yet\n")
+                    return
+                raw = (urllib.parse.parse_qs(parsed.query).get("duration") or [None])[0]
+                if raw is None:
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        self._respond(400, "Invalid Content-Length\n")
+                        return
+                    if length > 0:
+                        raw = self.rfile.read(min(length, 64)).decode("utf-8", "replace")
+                try:
+                    window_secs = _parse_catchup_duration(raw)
+                except ValueError as e:
+                    self._respond(400, f"{e}\n")
+                    return
+                _post_catchup_request(window_secs)
+                self._respond(
+                    200,
+                    f"Kafka catch-up signal sent: window={window_secs:.0f}s "
+                    "(acted on by the Rust consumer path only)\n",
+                )
+                rank_logger.info(
+                    "Kafka catch-up signal received via HTTP POST /catchup-kafka "
+                    "on port %d (window=%.0fs)",
+                    self.server.server_address[1],
+                    window_secs,
+                )
             else:
                 self.send_response(404)
                 self.end_headers()
 
         def do_GET(self):
-            if self.path == "/reset-kafka":
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/reset-kafka":
                 is_pending = _kafka_reset_event is not None and _kafka_reset_event.is_set()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(f"reset_pending={is_pending}\n".encode())
+                self._respond(200, f"reset_pending={is_pending}\n")
+            elif parsed.path == "/catchup-kafka":
+                self._respond(
+                    200,
+                    f"catchup_pending={_kafka_catchup_event.is_set()} "
+                    f"window_secs={_kafka_catchup_window_secs:.0f} "
+                    "(consumed by the Rust consumer path only)\n",
+                )
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -140,10 +244,15 @@ def _start_reset_http_server(base_port: int, num_ports: int) -> int | None:
             return None
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
-        rank_logger.info("Kafka reset HTTP server listening on port %d (POST /reset-kafka)", port)
+        rank_logger.info(
+            "Kafka control HTTP server listening on port %d "
+            "(POST /reset-kafka, POST /catchup-kafka)",
+            port,
+        )
         return port
     rank_logger.warning(
-        "Kafka reset HTTP server: no free port in %d-%d; live /reset-kafka disabled for this worker",
+        "Kafka control HTTP server: no free port in %d-%d; live /reset-kafka "
+        "and /catchup-kafka disabled for this worker",
         base_port,
         base_port + num_ports - 1,
     )
@@ -650,7 +759,8 @@ def _unify_record_batch_schemas(
                         raise
                 new_columns.append(col)
             else:
-                logger.warning(f"Column {name} not found in batch")
+                if name in required_columns:
+                    logger.warning(f"Column {name} not found in batch")
                 new_columns.append(pa.nulls(num_rows, type=target_type))
         result.append(pa.RecordBatch.from_arrays(new_columns, names=col_names))
 
@@ -757,17 +867,23 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
     compute_post_unexplored_label: bool = False
 
+    exclude_required_columns: str = ""
+
     def kafka_to_training_batch(
         self, batch: list[pa.RecordBatch], batch_size: int, shard_index: int = 0
     ) -> RecsysFeaturesBatch:
         del batch_size
         start_time = time.time()
 
+        required_columns: list[str] = list(REQUIRED_COLUMNS)
+        if self.exclude_required_columns:
+            excluded = {c.strip() for c in self.exclude_required_columns.split(",") if c.strip()}
+            required_columns = [c for c in required_columns if c not in excluded]
+
         if not self._logged_schema and batch:
             first_rb = batch[0]
             available_cols = first_rb.schema.names
-            expected_cols = REQUIRED_COLUMNS
-            missing_cols = [col for col in expected_cols if col not in available_cols]
+            missing_cols = [col for col in required_columns if col not in available_cols]
             if missing_cols:
                 rank_logger.error(
                     f"Schema mismatch! Missing required columns: {missing_cols}. "
@@ -777,7 +893,6 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 rank_logger.info(f"Schema validated. Available columns: {available_cols}")
             self._logged_schema = True
 
-        required_columns: list[str] = list(REQUIRED_COLUMNS)
         if self.multimodal_embedding_type is not None:
             embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
             if batch and embedding_col_name in batch[0].schema.names:
@@ -825,6 +940,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             global_post_sids=self.global_post_sids,
             sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
             compute_post_unexplored_label=self.compute_post_unexplored_label,
+            zero_stale_post_14d_candidate_counts=self.enable_stale_post,
         )
 
         elapsed = time.time() - t

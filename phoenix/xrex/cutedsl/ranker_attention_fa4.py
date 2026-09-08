@@ -6,74 +6,99 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
 
 
 _FA4_KERNEL_CACHE = {}
 
-_DENSE_BS_LAYOUT_CACHE = {}
+
+def build_dense_block_sparse_layout(seq_len, hist_len, num_q_heads, hist_valid_len):
+    block = 128
+    cand_len = seq_len - hist_len
+    assert hist_len % block == 0 and cand_len % block == 0, (
+        f"dense block-sparse needs tile-aligned lengths (hist={hist_len}, cand={cand_len})"
+    )
+    h_blocks = hist_len // block
+    num_blocks = seq_len // block
+    cand_blocks = num_blocks - h_blocks
+    idx_w = max(h_blocks, 1)
+
+    valid_len = jnp.asarray(hist_valid_len, jnp.int32).reshape(-1)[:, None]
+    batch_size = valid_len.shape[0]
+    n_full = valid_len // block
+    has_partial = (valid_len % block != 0).astype(jnp.int32)
+    t = jnp.arange(num_blocks, dtype=jnp.int32)[None, :]
+    is_hist = t < h_blocks
+    is_cand_i32 = (~is_hist).astype(jnp.int32)
+    is_full = ~is_hist | (t < n_full)
+    is_partial = is_hist & (t == n_full) & (has_partial == 1)
+
+    j_h = jnp.arange(idx_w, dtype=jnp.int32)[None, None, :]
+    j_n = jnp.arange(num_blocks, dtype=jnp.int32)[None, None, :]
+    n_full3 = n_full[:, :, None]
+
+    fwd_mask_cnt = jnp.where(is_partial, n_full + 1, jnp.where(is_full, has_partial, 0))
+    fwd_mask_idx = jnp.where(is_partial[:, :, None], j_h, n_full3)
+    fwd_full_cnt = jnp.where(is_full, n_full, 0)
+    fwd_full_idx = jnp.broadcast_to(j_h, (batch_size, num_blocks, idx_w))
+    fwd_diag_cnt = jnp.broadcast_to(is_cand_i32, (batch_size, num_blocks))
+    fwd_diag_idx = jnp.broadcast_to((t * is_cand_i32)[:, :, None], (batch_size, num_blocks, 1))
+
+    full_q_seq = jnp.clip(
+        jnp.where(j_n < n_full3, j_n, h_blocks + j_n - n_full3), 0, num_blocks - 1
+    )
+    mask_q_seq = jnp.clip(
+        jnp.where(j_n <= n_full3, j_n, h_blocks + j_n - n_full3 - 1), 0, num_blocks - 1
+    )
+    bwd_mask_cnt = jnp.where(
+        is_partial, n_full + cand_blocks + 1, jnp.where(t < n_full, has_partial, 0)
+    )
+    bwd_mask_idx = jnp.where(
+        is_partial[:, :, None],
+        jnp.broadcast_to(mask_q_seq, (batch_size, num_blocks, num_blocks)),
+        n_full3,
+    )
+    bwd_full_cnt = jnp.where(t < n_full, n_full + cand_blocks, 0)
+    bwd_full_idx = jnp.broadcast_to(full_q_seq, (batch_size, num_blocks, num_blocks))
+    bwd_diag_cnt = fwd_diag_cnt
+    bwd_diag_idx = fwd_diag_idx
+
+    valid_block_upper = jnp.where(is_hist, jnp.clip(valid_len - block * t, 0, block), 0)
+    valid_block_lower = jnp.where(is_hist, block, 0)
+
+    def _bcast(arr):
+        arr = arr.astype(jnp.int32)
+        return jnp.broadcast_to(arr[:, None], (batch_size, num_q_heads) + arr.shape[1:])
+
+    fwd_arrays = (
+        fwd_mask_cnt,
+        fwd_mask_idx,
+        fwd_full_cnt,
+        fwd_full_idx,
+        fwd_diag_cnt,
+        fwd_diag_idx,
+    )
+    bwd_arrays = (
+        bwd_mask_cnt,
+        bwd_mask_idx,
+        bwd_full_cnt,
+        bwd_full_idx,
+        bwd_diag_cnt,
+        bwd_diag_idx,
+    )
+    fwd_bs = tuple(_bcast(a) for a in fwd_arrays)
+    bwd_bs = tuple(_bcast(a) for a in bwd_arrays)
+    return fwd_bs, bwd_bs, _bcast(valid_block_upper), _bcast(valid_block_lower)
 
 
-def build_dense_block_sparse_layout(batch_size, seq_len, hist_len, num_q_heads):
-    key = (batch_size, seq_len, hist_len, num_q_heads)
-    if key not in _DENSE_BS_LAYOUT_CACHE:
-        import numpy as np
-
-        cand_len = seq_len - hist_len
-        assert hist_len % 128 == 0 and cand_len % 128 == 0, (
-            f"dense block-sparse needs tile-aligned lengths (hist={hist_len}, cand={cand_len})"
-        )
-        h_blocks = hist_len // 128
-        num_blocks = seq_len // 128
-        blocks = np.arange(num_blocks, dtype=np.int32)
-        is_cand = blocks >= h_blocks
-
-        fwd_mask_cnt = np.zeros(num_blocks, np.int32)
-        fwd_mask_idx = np.zeros((num_blocks, 1), np.int32)
-        fwd_full_cnt = np.full(num_blocks, h_blocks, np.int32)
-        fwd_full_idx = np.tile(blocks[:h_blocks], (num_blocks, 1))
-        fwd_diag_cnt = is_cand.astype(np.int32)
-        fwd_diag_idx = (blocks * is_cand).astype(np.int32)[:, None]
-
-        bwd_mask_cnt = np.zeros(num_blocks, np.int32)
-        bwd_mask_idx = np.zeros((num_blocks, 1), np.int32)
-        bwd_full_cnt = np.where(is_cand, 0, num_blocks).astype(np.int32)
-        bwd_full_idx = np.tile(blocks, (num_blocks, 1))
-        bwd_full_idx[is_cand] = 0
-        bwd_diag_cnt = is_cand.astype(np.int32)
-        bwd_diag_idx = (blocks * is_cand).astype(np.int32)[:, None]
-
-        def _bcast(arr):
-            return np.ascontiguousarray(np.broadcast_to(arr, (batch_size, num_q_heads) + arr.shape))
-
-        _DENSE_BS_LAYOUT_CACHE[key] = (
-            tuple(
-                _bcast(a)
-                for a in (
-                    fwd_mask_cnt,
-                    fwd_mask_idx,
-                    fwd_full_cnt,
-                    fwd_full_idx,
-                    fwd_diag_cnt,
-                    fwd_diag_idx,
-                )
-            ),
-            tuple(
-                _bcast(a)
-                for a in (
-                    bwd_mask_cnt,
-                    bwd_mask_idx,
-                    bwd_full_cnt,
-                    bwd_full_idx,
-                    bwd_diag_cnt,
-                    bwd_diag_idx,
-                )
-            ),
-        )
-    return _DENSE_BS_LAYOUT_CACHE[key]
-
-
-def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
+def ranker_attention_fa4(
+    q,
+    k,
+    v,
+    sm_scale,
+    block_sparse_layout,
+    valid_block_upper=None,
+    valid_block_lower=None,
+):
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -95,6 +120,13 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
     dKV_postprocess = True
 
     fwd_bs, bwd_bs = block_sparse_layout
+    if valid_block_upper is None or valid_block_lower is None:
+        if valid_block_upper is not None or valid_block_lower is not None:
+            raise ValueError("valid_block_upper and valid_block_lower must be provided together")
+        valid_block_upper = jnp.zeros(fwd_bs[2].shape, dtype=jnp.int32)
+        valid_block_lower = jnp.zeros(fwd_bs[2].shape, dtype=jnp.int32)
+    valid_block_upper = jnp.broadcast_to(valid_block_upper, fwd_bs[2].shape)
+    valid_block_lower = jnp.broadcast_to(valid_block_lower, fwd_bs[2].shape)
     bs_num_blocks = int(fwd_bs[3].shape[-2])
     bs_max_hist_blocks = int(fwd_bs[3].shape[-1])
     if bs_num_blocks != (seq_len + m_block - 1) // m_block:
@@ -112,6 +144,8 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
         seq_len,
         bs_num_blocks,
         bs_max_hist_blocks,
+        int(fwd_bs[1].shape[-1]),
+        int(bwd_bs[1].shape[-1]),
         use_pack_gqa,
     )
 
@@ -144,6 +178,8 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
             mFullIdx: cute.Tensor,
             mDiagCnt: cute.Tensor,
             mDiagIdx: cute.Tensor,
+            mValidUpper: cute.Tensor,
+            mValidLower: cute.Tensor,
             mO: cute.Tensor,
             mLSE: cute.Tensor,
             softmax_scale: cutlass.Float32,
@@ -160,6 +196,8 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
                 diag_block_cnt=mDiagCnt,
                 diag_block_idx=mDiagIdx,
                 dq_write_order_diag=None,
+                valid_block_upper=mValidUpper,
+                valid_block_lower=mValidLower,
             )
             fa_fwd(
                 mQ,
@@ -220,6 +258,8 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
                 mFullIdx: cute.Tensor,
                 mDiagCnt: cute.Tensor,
                 mDiagIdx: cute.Tensor,
+                mValidUpper: cute.Tensor,
+                mValidLower: cute.Tensor,
                 mdQa: cute.Tensor,
                 mdKa: cute.Tensor,
                 mdVa: cute.Tensor,
@@ -237,6 +277,8 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
                     diag_block_cnt=mDiagCnt,
                     diag_block_idx=mDiagIdx,
                     dq_write_order_diag=None,
+                    valid_block_upper=mValidUpper,
+                    valid_block_lower=mValidLower,
                 )
                 fa_bwd(
                     mQ,
@@ -270,7 +312,7 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
                     jax.ShapeDtypeStruct(dk_accum_shape, jnp.float32),
                     jax.ShapeDtypeStruct(dk_accum_shape, jnp.float32),
                 ],
-                input_output_aliases={12: 0, 13: 1, 14: 2},
+                input_output_aliases={14: 0, 15: 1, 16: 2},
                 use_static_tensors=False,
                 softmax_scale=cutlass.Float32(sm_scale),
             )
@@ -352,22 +394,23 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
 
     c = _FA4_KERNEL_CACHE[cache_key]
 
-    _fwd_extra = tuple(fwd_bs)
-    _bwd_extra = tuple(bwd_bs)
-
     @jax.custom_vjp
-    def _attention(q, k, v):
-        out, _lse = c["fwd_call"](q, k, v, *_fwd_extra)
+    def _attention(q, k, v, *bs_args):
+        fbs = bs_args[:6]
+        valid_bounds = bs_args[12:]
+        out, _lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
         return out
 
-    def _attention_fwd(q, k, v):
-        out, lse = c["fwd_call"](q, k, v, *_fwd_extra)
-        out = checkpoint_name(out, "attn_outputs")
-        lse = checkpoint_name(lse, "attn_outputs")
-        return out, (q, k, v, out, lse)
+    def _attention_fwd(q, k, v, *bs_args):
+        fbs = bs_args[:6]
+        valid_bounds = bs_args[12:]
+        out, lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
+        return out, (q, k, v, out, lse, bs_args)
 
     def _attention_bwd(res, g):
-        q, k, v, out, lse = res
+        q, k, v, out, lse, bs_args = res
+        bbs = bs_args[6:12]
+        valid_bounds = bs_args[12:]
 
         dpsum = jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32), axis=-1).transpose(0, 2, 1)
         if dpsum.shape[-1] < sr_q:
@@ -381,13 +424,31 @@ def ranker_attention_fa4(q, k, v, sm_scale, block_sparse_layout):
         dk_accum_init = jnp.zeros((batch_size, num_kv_heads, sr_k * hdr), dtype=jnp.float32)
         dv_accum_init = jnp.zeros_like(dk_accum_init)
         dq_accum, dk_accum, dv_accum = c["bwd_call"](
-            q, k, v, g, lse_log2, dpsum, *_bwd_extra, dq_accum_init, dk_accum_init, dv_accum_init
+            q,
+            k,
+            v,
+            g,
+            lse_log2,
+            dpsum,
+            *bbs,
+            *valid_bounds,
+            dq_accum_init,
+            dk_accum_init,
+            dv_accum_init,
         )
         (dq,) = c["post_dq_call"](dq_accum)
         (dk,) = c["post_dk_call"](dk_accum)
         (dv,) = c["post_dv_call"](dv_accum)
 
-        return dq, dk, dv
+        return (dq, dk, dv) + (None,) * len(bs_args)
 
     _attention.defvjp(_attention_fwd, _attention_bwd)
-    return _attention(q, k, v)
+    return _attention(
+        q,
+        k,
+        v,
+        *fwd_bs,
+        *bwd_bs,
+        valid_block_upper,
+        valid_block_lower,
+    )

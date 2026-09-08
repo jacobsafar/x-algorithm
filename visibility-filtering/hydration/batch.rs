@@ -25,10 +25,6 @@ impl<V> Hydrated<V> {
             Hydrated::NotFound | Hydrated::Failed(_) => None,
         }
     }
-
-    pub(crate) fn is_failed(&self) -> bool {
-        matches!(self, Hydrated::Failed(_))
-    }
 }
 
 impl<V, E: Display> From<Result<Option<V>, E>> for Hydrated<V> {
@@ -104,14 +100,6 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
                 .map(|key| (key, Hydrated::Failed(HydrationError::Timeout)))
                 .collect(),
         }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.results.len()
-    }
-
-    pub(crate) fn failed_count(&self) -> usize {
-        self.results.values().filter(|r| r.is_failed()).count()
     }
 
     pub(crate) fn hydrated(&self, key: &K) -> Option<&Hydrated<V>> {
@@ -214,7 +202,6 @@ mod tests {
         );
         assert_eq!(batch.get_or_default(&2), 0);
         assert_eq!(batch.get_or_default(&3), 0);
-        assert_eq!(batch.failed_count(), 1);
     }
 
     #[test]
@@ -226,7 +213,6 @@ mod tests {
             batch.hydrated(&2),
             Some(&Hydrated::Failed(HydrationError::MissingResponse))
         );
-        assert_eq!(batch.failed_count(), 1);
     }
 
     #[test]
@@ -237,8 +223,6 @@ mod tests {
             batch.hydrated(&1),
             Some(&Hydrated::Failed(HydrationError::Timeout))
         );
-        assert_eq!(batch.failed_count(), 2);
-        assert_eq!(batch.len(), 2);
     }
 
     #[test]
@@ -267,7 +251,6 @@ mod tests {
             by_tweet.hydrated(&TweetId(3)),
             Some(&Hydrated::Failed(_))
         ));
-        assert_eq!(by_tweet.failed_count(), 1);
     }
 
     #[test]
@@ -289,7 +272,6 @@ mod tests {
 
         assert_eq!(batch.get(&1), Some(&7));
         assert_eq!(batch.get(&2), Some(&8));
-        assert_eq!(batch.failed_count(), 0);
     }
 
     #[test]
@@ -302,6 +284,5 @@ mod tests {
             batch.hydrated(&2),
             Some(&Hydrated::Failed(HydrationError::MissingResponse))
         );
-        assert_eq!(batch.failed_count(), 1);
     }
 }

@@ -227,6 +227,11 @@ class MediaLoader:
                 grox_config.media_hydration.enable_light_dark_enhancement
                 and is_main_post
             )
+            should_enable_motion_reveal = (
+                grox_config.media_hydration.enable_motion_reveal
+                and is_main_post
+                and is_high_fav
+            )
             for medium in post.media:
                 if isinstance(medium, Image):
                     tasks.append(
@@ -244,6 +249,7 @@ class MediaLoader:
                             is_main_post,
                             is_high_fav,
                             should_enable_clahe_enhancement,
+                            should_enable_motion_reveal,
                         )
                     )
         if post.broadcast_metadata and post.broadcast_metadata.thumbnail_image:
@@ -377,6 +383,7 @@ class MediaLoader:
         is_main_post: bool = False,
         is_high_fav: bool = False,
         enable_clahe_enhancement: bool = False,
+        enable_motion_reveal: bool = False,
     ) -> None:
         url = None
         if video.videoInfo and video.videoInfo.durationMillis:
@@ -458,6 +465,7 @@ class MediaLoader:
                 is_main_post,
                 is_high_fav,
                 enable_clahe_enhancement,
+                enable_motion_reveal,
             )
             Metrics.counter("media_loader.hydrate_video_success.count").add(
                 1, attributes=cls._metrics_attributes()
@@ -527,6 +535,7 @@ class MediaLoader:
         is_main_post: bool = False,
         is_high_fav: bool = False,
         enable_clahe_enhancement: bool = False,
+        enable_motion_reveal: bool = False,
     ) -> ConvoVideo:
         video_max_frames = grox_config.media_hydration.video_max_frames_light
         video_tile_size = grox_config.media_hydration.video_tile_size
@@ -545,6 +554,7 @@ class MediaLoader:
             video_tile_size,
             enable_clahe=enable_clahe_enhancement,
             include_combined_video_bytes=False,
+            enable_motion_reveal=enable_motion_reveal,
         )
         times = [frame.time_sec for frame in video_data.frames]
         frames = [frame.frame for frame in video_data.frames]
@@ -574,10 +584,20 @@ class MediaLoader:
                 1, attributes=cls._metrics_attributes()
             )
 
+        if video_data.motion_reveal_frames:
+            Metrics.counter("media_loader.motion_reveal_built.count").add(
+                1, attributes=cls._metrics_attributes()
+            )
+        elif enable_motion_reveal:
+            Metrics.counter("media_loader.motion_reveal_skipped.count").add(
+                1, attributes=cls._metrics_attributes()
+            )
+
         return ConvoVideo(
             frames=frames,
             subtitles=subtitles,
             duration=duration,
             total_duration=total_duration,
             is_deluxe_target=is_main_post and is_high_fav,
+            motion_reveal_frames=video_data.motion_reveal_frames,
         )

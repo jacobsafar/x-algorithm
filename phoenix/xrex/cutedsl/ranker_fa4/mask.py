@@ -354,6 +354,9 @@ class AttentionMask:
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         mask_diagonal: cutlass.Constexpr[bool] = False,
+        mask_block_union: cutlass.Constexpr[bool] = False,
+        valid_block_upper: Optional[cute.Tensor] = None,
+        valid_block_lower: Optional[cute.Tensor] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
         aux_tensors: Optional[list] = None,
@@ -364,8 +367,12 @@ class AttentionMask:
         rBitmask: Optional[cute.Tensor] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
-        assert not (mask_diagonal and (mask_causal or mask_local or mask_mod is not None)), (
-            "mask_diagonal is mutually exclusive with mask_causal/mask_local/mask_mod"
+        assert not (
+            mask_diagonal
+            and (mask_causal or mask_local or mask_mod is not None or mask_block_union)
+        ), "mask_diagonal is mutually exclusive with all other masks"
+        assert not (mask_block_union and (mask_causal or mask_local or mask_mod is not None)), (
+            "mask_block_union is mutually exclusive with causal/local/mask_mod"
         )
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
@@ -413,6 +420,41 @@ class AttentionMask:
                     else:
                         mask_row = global_row
                     acc_S[i] = -Float32.inf if mask_row >= self.seqlen_q else acc_S[i]
+
+        elif const_expr(mask_block_union):
+            assert valid_block_upper is not None and valid_block_lower is not None
+            qpk = const_expr(self.qhead_per_kvhead_packgqa)
+            if const_expr(qpk != 1):
+                q_block = m_block // qpk
+            else:
+                q_block = m_block
+            q_upper = valid_block_upper[batch_idx, head_idx, q_block]
+            q_lower = valid_block_lower[batch_idx, head_idx, q_block]
+            kv_upper = valid_block_upper[batch_idx, head_idx, n_block]
+            kv_lower = valid_block_lower[batch_idx, head_idx, n_block]
+            ncol = const_expr(cute.size(tScS_t2r.shape))
+            for i in cutlass.range_constexpr(ncol):
+                row_coord = tScS_t2r[i][0]
+                col_coord = tScS_t2r[i][1]
+                if const_expr(qpk != 1):
+                    q_coord = ((m_block % qpk) * self.tile_m + row_coord) // qpk
+                else:
+                    q_coord = row_coord
+                q_valid = (q_coord < q_upper) or (q_coord >= q_lower)
+                kv_valid = (col_coord < kv_upper) or (col_coord >= kv_lower)
+                valid = q_valid and kv_valid
+                if const_expr(mask_seqlen):
+                    global_col = col_coord + n_block * self.tile_n
+                    valid = valid and global_col < self.seqlen_k
+                if check_q_boundary:
+                    global_row = row_coord + m_block * self.tile_m
+                    if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                        assert head_divmod is not None
+                        mask_row, _ = divmod(global_row, head_divmod)
+                    else:
+                        mask_row = global_row
+                    valid = valid and mask_row < self.seqlen_q
+                acc_S[i] = acc_S[i] if valid else -Float32.inf
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
@@ -551,6 +593,9 @@ class AttentionMask:
         fastdiv_mods=(None, None),
         is_full_block: bool = False,
         is_diagonal_block: bool = False,
+        mask_block_union: cutlass.Constexpr[bool] = False,
+        valid_block_upper: Optional[cute.Tensor] = None,
+        valid_block_lower: Optional[cute.Tensor] = None,
         check_m_boundary: bool = True,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
@@ -580,6 +625,44 @@ class AttentionMask:
                     kv_out_of_bounds = global_kv >= self.seqlen_k
                     out_of_bounds = q_out_of_bounds or kv_out_of_bounds
                     acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
+
+        elif const_expr(mask_block_union):
+            assert valid_block_upper is not None and valid_block_lower is not None
+            if is_full_block:
+                if const_expr(mask_seqlen):
+                    if seqlenk_col_limit <= 0:
+                        for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                            acc_S[i] = -cutlass.Float32.inf
+                    elif check_m_boundary:
+                        ncol = const_expr(cute.size(tScS_t2r.shape))
+                        for i in cutlass.range_constexpr(ncol):
+                            row_coord = tScS_t2r[i][ROW]
+                            col_coord = tScS_t2r[i][COL]
+                            global_q = row_coord + m_block * self.tile_m
+                            global_kv = col_coord + n_block * self.tile_n
+                            out_of_bounds = (global_q >= self.seqlen_q) or (
+                                global_kv >= self.seqlen_k
+                            )
+                            acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
+            else:
+                q_upper = valid_block_upper[batch_idx, head_idx, m_block]
+                q_lower = valid_block_lower[batch_idx, head_idx, m_block]
+                kv_upper = valid_block_upper[batch_idx, head_idx, n_block]
+                kv_lower = valid_block_lower[batch_idx, head_idx, n_block]
+                ncol = const_expr(cute.size(tScS_t2r.shape))
+                for i in cutlass.range_constexpr(ncol):
+                    row_coord = tScS_t2r[i][ROW]
+                    col_coord = tScS_t2r[i][COL]
+                    q_valid = (row_coord < q_upper) or (row_coord >= q_lower)
+                    kv_valid = (col_coord < kv_upper) or (col_coord >= kv_lower)
+                    valid = q_valid and kv_valid
+                    if const_expr(mask_seqlen):
+                        global_q = row_coord + m_block * self.tile_m
+                        global_kv = col_coord + n_block * self.tile_n
+                        q_out_of_bounds = check_m_boundary and (global_q >= self.seqlen_q)
+                        kv_out_of_bounds = global_kv >= self.seqlen_k
+                        valid = valid and not (q_out_of_bounds or kv_out_of_bounds)
+                    acc_S[i] = acc_S[i] if valid else -cutlass.Float32.inf
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
             if is_full_block:

@@ -7,6 +7,7 @@ pub mod feed_log;
 pub mod phoenix_request;
 pub mod rescore;
 pub mod shadow;
+pub mod strato_context;
 pub mod string_case;
 pub mod tweet_type_metrics;
 pub mod url;

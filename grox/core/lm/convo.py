@@ -20,6 +20,13 @@ STORYBOARD_COLUMNS = 3
 STORYBOARD_TILE_SIZE = 448
 NO_THINKING_PROMPT = grox_config.prompt_tokens.no_thinking_prompt
 
+MOTION_REVEAL_DESCRIPTION = (
+    "Motion-reveal stills for this video follow (static layer subtracted, faint moving layers amplified); "
+    "they distort colors and motion, and can make opaque clothing look like bare skin. People or acts "
+    "absent from the frames above but visible here are the video's actual overlay-hidden content; judge "
+    "anyone already visible above solely from the original frames."
+)
+
 
 class Role(str, Enum):
     USER = "User"
@@ -50,12 +57,13 @@ class Video(BaseModel):
     duration: float
     total_duration: float
     is_deluxe_target: bool = False
+    motion_reveal_frames: list[bytes] = Field(default_factory=lambda: [])
 
-    @field_serializer("frames", when_used="json")
+    @field_serializer("frames", "motion_reveal_frames", when_used="json")
     def serialize_frames(self, value: list[bytes]) -> list[str]:
         return [b64encode(frame).decode("utf-8") for frame in value]
 
-    @field_validator("frames", mode="before")
+    @field_validator("frames", "motion_reveal_frames", mode="before")
     @classmethod
     def decode_frames(cls, value: list[str] | list[bytes]) -> list[bytes]:
         is_list_str = len(value) > 0 and isinstance(value[0], str)
@@ -154,6 +162,11 @@ class Video(BaseModel):
                     res.append(f" Subtitles: {'; '.join(subtitle_texts)}")
 
             res.append("\n")
+
+        if self.motion_reveal_frames:
+            res.append(f"{MOTION_REVEAL_DESCRIPTION}\n")
+            for idx, reveal_bytes in enumerate(self.motion_reveal_frames):
+                res.extend([" ", reveal_bytes, f" Motion-reveal still {idx + 1}\n"])
 
         return res
 
@@ -371,6 +384,18 @@ class Conversation(BaseModel):
                             }
                         )
                         parts.append(_image_part(frame))
+                    if c.motion_reveal_frames:
+                        parts.append(
+                            {"type": "text", "text": MOTION_REVEAL_DESCRIPTION}
+                        )
+                        for idx, reveal in enumerate(c.motion_reveal_frames):
+                            parts.append(
+                                {
+                                    "type": "text",
+                                    "text": f"Motion-reveal still {idx + 1}",
+                                }
+                            )
+                            parts.append(_image_part(reveal))
 
             if not parts:
                 continue

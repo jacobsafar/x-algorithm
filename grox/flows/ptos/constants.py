@@ -23,3 +23,7 @@ GEMMA = "oai-gemma4-26b"
 GEMMA_PTOS_REALTIME = "oai-gemma4-26b-ptos-realtime"
 
 HIGH_FAV_THRESHOLD = 128
+
+SAFETY_PTOS_SPECIAL_VIDEO = "safety_ptos_special_video"
+TOPIC_SPECIAL_VIDEO = "safety-ptos-special-video"
+DELUXE_TIER_TASK_TYPES = frozenset({SAFETY_PTOS_DELUXE, SAFETY_PTOS_SPECIAL_VIDEO})

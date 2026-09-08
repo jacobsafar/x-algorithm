@@ -41,7 +41,6 @@ impl FallbackReason {
 pub(crate) enum FailureKind {
     ManhattanFetch,
     ManhattanDecode,
-    Other,
 }
 
 impl FailureKind {
@@ -49,7 +48,6 @@ impl FailureKind {
         match self {
             Self::ManhattanFetch => "manhattan_fetch",
             Self::ManhattanDecode => "manhattan_decode",
-            Self::Other => "other",
         }
     }
 }

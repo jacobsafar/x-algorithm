@@ -1,6 +1,6 @@
 use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::hydration::batch::{AuthorHydrationBatch, HydrationBatch, TweetHydrationBatch};
-use crate::hydration::fallback_cache::{FallbackCache, FallbackCacheMode};
+use crate::hydration::fallback_cache::FallbackCache;
 use crate::hydration::metrics::{record_batch_size, timed_results};
 use crate::hydration::{keyed_by_author, tweets_per_author};
 use crate::models::{AuthorFeatures, AuthorId, TweetCandidateInput, UserLabelSet};
@@ -16,15 +16,22 @@ const CACHE_CAPACITY: usize = 1_000_000;
 
 pub struct GizmoduckAuthorHydrator {
     pub gizmoduck_client: GizmoduckLookup,
-    fallback_cache: FallbackCache<AuthorId, AuthorFeatures>,
+    fallback_cache: Option<FallbackCache<AuthorId, AuthorFeatures>>,
 }
 
 impl GizmoduckAuthorHydrator {
-    pub(crate) fn new(gizmoduck_client: GizmoduckLookup, cache_mode: FallbackCacheMode) -> Self {
+    pub(crate) fn new(
+        gizmoduck_client: GizmoduckLookup,
+        fallback_cache: Option<FallbackCache<AuthorId, AuthorFeatures>>,
+    ) -> Self {
         Self {
             gizmoduck_client,
-            fallback_cache: FallbackCache::new("author", CACHE_CAPACITY, cache_mode),
+            fallback_cache,
         }
+    }
+
+    pub(crate) fn fallback_cache() -> FallbackCache<AuthorId, AuthorFeatures> {
+        FallbackCache::new("author", CACHE_CAPACITY)
     }
 
     pub(crate) async fn hydrate(
@@ -32,10 +39,10 @@ impl GizmoduckAuthorHydrator {
         candidates: &[TweetCandidateInput],
         safety_level: SafetyLevel,
     ) -> TweetHydrationBatch<AuthorFeatures> {
-        let generation = self
+        let cache_request = self
             .fallback_cache
-            .enabled()
-            .then(|| self.fallback_cache.begin_request());
+            .as_ref()
+            .map(|cache| (cache, cache.begin_request()));
         let candidate_count_by_key = tweets_per_author(candidates);
         let author_ids: Vec<u64> = candidate_count_by_key.keys().map(|a| a.get()).collect();
 
@@ -61,9 +68,8 @@ impl GizmoduckAuthorHydrator {
         };
 
         let author_features = user_results.map(author_features);
-        let author_features = if let Some(generation) = generation {
-            self.fallback_cache
-                .resolve_hydration_batch(generation, author_features)
+        let author_features = if let Some((cache, generation)) = cache_request {
+            cache.resolve_hydration_batch(generation, author_features)
         } else {
             author_features
         };
@@ -205,7 +211,7 @@ mod tests {
         let client = Arc::new(MockGizmoduckClient::default());
         let hydrator = GizmoduckAuthorHydrator::new(
             GizmoduckLookup::new(client.clone()),
-            FallbackCacheMode::ServeStale,
+            Some(FallbackCache::with_test_capacity("author")),
         );
         let candidates = vec![candidate(1, 10), candidate(2, 10)];
 
@@ -214,8 +220,6 @@ mod tests {
             .await;
 
         assert_eq!(client.call_count(), 1);
-        assert_eq!(features.len(), 2);
-        assert_eq!(features.failed_count(), 0);
         for tweet_id in [TweetId(1), TweetId(2)] {
             assert!(matches!(
                 features.hydrated(&tweet_id),
@@ -233,36 +237,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_recovery_respects_cache_mode() {
+    async fn stale_recovery_uses_resident_value() {
         let candidates = vec![candidate(1, 10)];
-        for (mode, serves_stale) in [
-            (FallbackCacheMode::ServeStale, true),
-            (FallbackCacheMode::Shadow, false),
-            (FallbackCacheMode::Disabled, false),
-        ] {
-            let hydrator = GizmoduckAuthorHydrator::new(
-                GizmoduckLookup::new(Arc::new(FailingAfterFirstClient {
-                    calls: AtomicUsize::new(0),
-                })),
-                mode,
-            );
-            let first = hydrator
-                .hydrate(&candidates, SafetyLevel::TimelineHome)
-                .await;
-            assert!(first.get_or_default(&TweetId(1)).is_suspended);
+        let hydrator = GizmoduckAuthorHydrator::new(
+            GizmoduckLookup::new(Arc::new(FailingAfterFirstClient {
+                calls: AtomicUsize::new(0),
+            })),
+            Some(FallbackCache::with_test_capacity("author")),
+        );
+        let first = hydrator
+            .hydrate(&candidates, SafetyLevel::TimelineHome)
+            .await;
+        assert!(first.get_or_default(&TweetId(1)).is_suspended);
 
-            let second = hydrator
-                .hydrate(&candidates, SafetyLevel::TimelineHome)
-                .await;
-            if serves_stale {
-                assert!(second.get_or_default(&TweetId(1)).is_suspended);
-            } else {
-                assert!(matches!(
-                    second.hydrated(&TweetId(1)),
-                    Some(Hydrated::Failed(_))
-                ));
-            }
-        }
+        let second = hydrator
+            .hydrate(&candidates, SafetyLevel::TimelineHome)
+            .await;
+        assert!(second.get_or_default(&TweetId(1)).is_suspended);
     }
 
     #[test]
@@ -277,8 +268,11 @@ mod tests {
             .map(author_features)
             .project([(TweetId(1), a10), (TweetId(2), a20)]);
 
-        assert_eq!(by_tweet.failed_count(), 2);
         for tweet_id in [TweetId(1), TweetId(2)] {
+            assert!(matches!(
+                by_tweet.hydrated(&tweet_id),
+                Some(Hydrated::Failed(_))
+            ));
             let feature = by_tweet.get_or_default(&tweet_id);
             assert!(!feature.is_suspended);
             assert!(!feature.is_deactivated);

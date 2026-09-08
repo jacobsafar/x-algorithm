@@ -1,4 +1,5 @@
 import io
+import math
 from dataclasses import dataclass
 import logging
 import cv2
@@ -152,3 +153,127 @@ def pad_image(image_bytes: bytes) -> bytes:
     with Image.open(io.BytesIO(image_bytes)) as img:
         with img.convert("RGB") as image:
             return _padded_image(image)
+
+
+_MOTION_REVEAL_MIN_FRAMES = 4
+_MOTION_REVEAL_MAX_INPUT_FRAMES = 32
+_MOTION_REVEAL_WORK_MAX_DIM = 640
+_MOTION_REVEAL_COVER_WEIGHT = 0.7
+_MOTION_REVEAL_GRID_FRAMES = 4
+_MOTION_REVEAL_GRID_COLUMNS = 2
+_MOTION_REVEAL_JPEG_QUALITY = 90
+_MOTION_REVEAL_MIN_RESIDUAL_P99 = 3.0
+_MOTION_REVEAL_MAX_RESIDUAL_P99 = 75.0
+
+
+def _decode_reveal_frame(frame_bytes: bytes) -> np.ndarray | None:
+    img = cv2.imdecode(np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    scale = _MOTION_REVEAL_WORK_MAX_DIM / max(h, w)
+    if scale < 1.0:
+        img = cv2.resize(
+            img,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return img.astype(np.float32)
+
+
+def _stretch_to_u8(arr: np.ndarray) -> np.ndarray:
+    lo = float(np.percentile(arr, 2))
+    hi = float(np.percentile(arr, 98))
+    if hi <= lo + 1e-3:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    return np.clip((arr - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+
+def _encode_reveal(bgr: np.ndarray) -> bytes | None:
+    ok, jpeg = cv2.imencode(
+        ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), _MOTION_REVEAL_JPEG_QUALITY]
+    )
+    return jpeg.tobytes() if ok else None
+
+
+def _skin_fraction(bgr_u8: np.ndarray) -> float:
+    ycrcb = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2YCrCb)
+    mask = (
+        (ycrcb[:, :, 0] > 60)
+        & (ycrcb[:, :, 1] > 135)
+        & (ycrcb[:, :, 1] < 175)
+        & (ycrcb[:, :, 2] > 80)
+        & (ycrcb[:, :, 2] < 130)
+    )
+    return float(mask.mean())
+
+
+def build_motion_reveal_images(frame_jpegs: list[bytes]) -> list[bytes]:
+    if len(frame_jpegs) < _MOTION_REVEAL_MIN_FRAMES:
+        return []
+    if len(frame_jpegs) > _MOTION_REVEAL_MAX_INPUT_FRAMES:
+        indices = np.linspace(
+            0, len(frame_jpegs) - 1, _MOTION_REVEAL_MAX_INPUT_FRAMES
+        ).astype(int)
+        frame_jpegs = [frame_jpegs[i] for i in indices]
+
+    decoded: list[np.ndarray] = []
+    target_hw: tuple[int, int] | None = None
+    for frame_bytes in frame_jpegs:
+        img = _decode_reveal_frame(frame_bytes)
+        if img is None:
+            continue
+        if target_hw is None:
+            target_hw = (img.shape[0], img.shape[1])
+        elif (img.shape[0], img.shape[1]) != target_hw:
+            img = cv2.resize(
+                img, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_AREA
+            )
+        decoded.append(img)
+    if len(decoded) < _MOTION_REVEAL_MIN_FRAMES:
+        return []
+
+    stack = np.stack(decoded, axis=0)
+    median = np.median(stack, axis=0)
+    residual = np.abs(stack - median[None]).mean(axis=-1)
+    per_frame_p99 = np.percentile(residual.reshape(len(decoded), -1), 99, axis=1)
+    if (
+        not _MOTION_REVEAL_MIN_RESIDUAL_P99
+        <= float(np.median(per_frame_p99))
+        <= _MOTION_REVEAL_MAX_RESIDUAL_P99
+    ):
+        return []
+    motion_energy = residual.mean(axis=(1, 2))
+
+    unmixed = [
+        _stretch_to_u8(frame - _MOTION_REVEAL_COVER_WEIGHT * median) for frame in stack
+    ]
+    skin = np.array([_skin_fraction(still) for still in unmixed])
+    order = np.argsort(-(motion_energy * (0.5 + skin)))
+
+    out: list[bytes] = []
+
+    best = int(order[0])
+    pair = np.concatenate([stack[best].astype(np.uint8), unmixed[best]], axis=1)
+    encoded = _encode_reveal(pair)
+    if encoded:
+        out.append(encoded)
+
+    encoded = _encode_reveal(unmixed[best])
+    if encoded:
+        out.append(encoded)
+
+    grid_indices = sorted(int(i) for i in order[:_MOTION_REVEAL_GRID_FRAMES])
+    tiles = [unmixed[i] for i in grid_indices]
+    h, w = tiles[0].shape[:2]
+    cols = _MOTION_REVEAL_GRID_COLUMNS
+    rows = math.ceil(len(tiles) / cols)
+    canvas = np.zeros((rows * h, cols * w, 3), dtype=np.uint8)
+    for i, tile in enumerate(tiles):
+        row, col = divmod(i, cols)
+        canvas[row * h : (row + 1) * h, col * w : (col + 1) * w] = tile
+    encoded = _encode_reveal(canvas)
+    if encoded:
+        out.append(encoded)
+
+    return out

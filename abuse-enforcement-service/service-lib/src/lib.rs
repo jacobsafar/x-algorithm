@@ -7,6 +7,7 @@ pub mod decision;
 pub mod dedup_cache;
 pub mod entities;
 pub mod facts;
+pub mod generic_actions;
 pub mod gizmoduck;
 pub mod gizmoduck_labels;
 pub mod growthbook;
@@ -41,16 +42,15 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, warn};
 use xai_kafka::{
-    BatchConsumerConfig, BatchResult, CancellationToken, KafkaBatchProcessor, KafkaConsumerBuilder,
-    KafkaConsumerConfig, KafkaMessage, KafkaProducer, KafkaProducerConfigBuilder, SslConfig,
+    BatchConsumerConfig, BatchResult, CancellationToken, KafkaBatchProcessor, KafkaConsumerConfig,
+    KafkaConsumerConfigBuilder, KafkaMessage, KafkaProducer, KafkaProducerConfigBuilder,
     apply_auth_config, resolve_kafka_brokers, run_batch_consumer, self_delete_pod,
 };
 use xai_service_runner::{ServerBuilder, ServerInfo};
-use xai_wily::WilyConfig;
 
 use xai_strato::{Strato, StratoClientConfig};
 
-use crate::config::{Config, KafkaConnConfig};
+use crate::config::Config;
 use crate::decision::Decision;
 use crate::facts::{EntityFacts, EntityType, Facts, PostFacts, ScoreFacts, UserFacts};
 use crate::growthbook::DynamicConfig;
@@ -132,6 +132,7 @@ struct EnforcementCtx {
             rules_cache: Arc<rules::RulesCache>,
     allowlist: Option<allowlist::ManhattanAllowlist>,
             kafka_producer_decisions: Option<Arc<KafkaProducer>>,
+                kafka_producer_decisions_json: Option<Arc<KafkaProducer>>,
 }
 
 struct ScoreResultProcessor {
@@ -167,6 +168,35 @@ fn decision_outcome(
         head: crate::facts::head_label(score).to_owned(),
         fired_heads: summary.map(|s| s.fired_heads.clone()).unwrap_or_default(),
         labels: summary.map(|s| s.labels.clone()).unwrap_or_default(),
+    }
+}
+
+const REQUESTED_ACTIONS_DENIED: &str = "requested_actions_denied";
+
+#[derive(Debug, PartialEq)]
+enum ExpandedDecision {
+    Skip(String),
+    Act(Vec<decision::ActionSpec>),
+}
+
+fn expand_requested_actions_decision(
+    entity_type: EntityType,
+    score_facts: &ScoreFacts,
+    allowlist: &generic_actions::GenericActionAllowlist,
+) -> (ExpandedDecision, Option<String>) {
+    let resolved = generic_actions::resolve_requested_actions(
+        entity_type,
+        &score_facts.requested_actions,
+        allowlist,
+    );
+    let skipped_json = resolved.skipped_info_json();
+    if resolved.specs.is_empty() {
+        (
+            ExpandedDecision::Skip(REQUESTED_ACTIONS_DENIED.into()),
+            skipped_json,
+        )
+    } else {
+        (ExpandedDecision::Act(resolved.specs), skipped_json)
     }
 }
 
@@ -341,20 +371,41 @@ async fn run_enforcement_inner(
         }
     };
 
+    let (decision, mut requested_actions_skipped) = match decision {
+        Decision::ActRequestedActions => expand_requested_actions_decision(
+            facts.entity_type,
+            &facts.score,
+            &ctx.dynamic_config
+                .generic_action_allowlist(facts.entity_type),
+        ),
+        Decision::Skip(reason) => (ExpandedDecision::Skip(reason), None),
+        Decision::Act(specs) => (ExpandedDecision::Act(specs), None),
+    };
+
     match decision {
-        Decision::Skip(reason) => Ok(skip_outcome(reason, dry_run, &facts, score)),
-        Decision::Act(specs) => {
+        ExpandedDecision::Skip(reason) => {
+            let mut outcome = skip_outcome(reason, dry_run, &facts, score);
+            if let Some(json) = requested_actions_skipped {
+                outcome
+                    .info
+                    .insert("requested_actions_skipped".into(), json);
+            }
+            Ok(outcome)
+        }
+        ExpandedDecision::Act(specs) => {
             if !ctx.dynamic_config.try_enforce(facts.entity_type).await {
                 warn!(
                     entity_type = facts.entity_type.as_str(),
                     "max enforcement has been reached; skipping"
                 );
-                return Ok(skip_outcome(
-                    "max_enforcement_reached".into(),
-                    dry_run,
-                    &facts,
-                    score,
-                ));
+                let mut outcome =
+                    skip_outcome("max_enforcement_reached".into(), dry_run, &facts, score);
+                if let Some(json) = requested_actions_skipped.take() {
+                    outcome
+                        .info
+                        .insert("requested_actions_skipped".into(), json);
+                }
+                return Ok(outcome);
             }
 
             let user_id = facts.user_id;
@@ -390,6 +441,15 @@ async fn run_enforcement_inner(
                 .iter()
                 .map(|a| (a.name(), a.metric_label()))
                 .collect();
+
+            additional_info_map.insert(
+                "action_kinds".into(),
+                serde_json::to_string(&uas_action_dims.iter().map(|(a, _)| *a).collect::<Vec<_>>())
+                    .unwrap_or_else(|_| "[]".into()),
+            );
+            if let Some(json) = requested_actions_skipped {
+                additional_info_map.insert("requested_actions_skipped".into(), json);
+            }
 
             enforce_actions(
                 &ctx.ais_client,
@@ -493,6 +553,8 @@ async fn write_dedup_outcome(
 
 const DECISIONS_PRODUCER: &str = "decisions";
 
+const DECISIONS_JSON_PRODUCER: &str = "decisions_json";
+
 pub(crate) const ADMIN_ACTIONS_PRODUCER: &str = "admin_actions";
 
 #[derive(Clone, Default)]
@@ -507,6 +569,10 @@ impl KafkaProducers {
 
             pub fn decisions(&self) -> Option<&Arc<KafkaProducer>> {
         self.get(DECISIONS_PRODUCER)
+    }
+
+            pub fn decisions_json(&self) -> Option<&Arc<KafkaProducer>> {
+        self.get(DECISIONS_JSON_PRODUCER)
     }
 
             pub fn admin_actions(&self) -> Option<&Arc<KafkaProducer>> {
@@ -531,9 +597,32 @@ pub(crate) fn spawn_publish<M: prost::Message>(
     let Some(producer) = producer else {
         return;
     };
-    let key = key();
-    let bytes = record.encode_to_vec();
-    let producer = producer.clone();
+    spawn_send(producer.clone(), sink, key(), record.encode_to_vec());
+}
+
+pub(crate) fn spawn_publish_json<M: serde::Serialize>(
+    producer: Option<&Arc<KafkaProducer>>,
+    sink: &'static str,
+    key: impl FnOnce() -> Vec<u8>,
+    record: &M,
+) {
+    let Some(producer) = producer else {
+        return;
+    };
+    let bytes = match serde_json::to_vec(record) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!("{sink} JSON encode failed, record dropped: {e}");
+            metrics::KAFKA_PUBLISH_TOTAL
+                .with_label_values(&[sink, "encode_error"])
+                .inc();
+            return;
+        }
+    };
+    spawn_send(producer.clone(), sink, key(), bytes);
+}
+
+fn spawn_send(producer: Arc<KafkaProducer>, sink: &'static str, key: Vec<u8>, bytes: Vec<u8>) {
     tokio::spawn(async move {
         let result = match producer.send_with_key(Some(key.as_slice()), &bytes).await {
             Ok(_) => "ok",
@@ -548,13 +637,16 @@ pub(crate) fn spawn_publish<M: prost::Message>(
     });
 }
 
-fn publish_decision_outcome(
-    producer: Option<&Arc<KafkaProducer>>,
-    outcome: &abuse_proto::DecisionOutcome,
-) {
+fn publish_decision_outcome(ctx: &EnforcementCtx, outcome: &abuse_proto::DecisionOutcome) {
     spawn_publish(
-        producer,
+        ctx.kafka_producer_decisions.as_ref(),
         DECISIONS_PRODUCER,
+        || outcome.entity_id.to_string().into_bytes(),
+        outcome,
+    );
+    spawn_publish_json(
+        ctx.kafka_producer_decisions_json.as_ref(),
+        DECISIONS_JSON_PRODUCER,
         || outcome.entity_id.to_string().into_bytes(),
         outcome,
     );
@@ -566,28 +658,12 @@ async fn run_enforcement(
     source_topic: &str,
 ) -> Result<abuse_proto::DecisionOutcome> {
     let outcome = run_enforcement_inner(ctx, score, source_topic).await?;
-    publish_decision_outcome(ctx.kafka_producer_decisions.as_ref(), &outcome);
+    publish_decision_outcome(ctx, &outcome);
     Ok(outcome)
-}
-
-fn sasl_ssl_config(conn: &KafkaConnConfig, password: &str) -> SslConfig {
-    SslConfig {
-        security_protocol: "SASL_SSL".to_string(),
-        sasl_mechanism: Some(conn.sasl_mechanism.clone()),
-        sasl_username: Some(conn.sasl_username.clone()),
-        sasl_password: Some(password.to_owned()),
-    }
 }
 
 async fn build_kafka_producers(cfg: &Config, dynamic_config: &DynamicConfig) -> KafkaProducers {
     let mut producers = KafkaProducers::default();
-
-    let conn = cfg.kafka_producer();
-    let sasl_password = conn.sasl_password.clone();
-
-    if !cfg.kafka_producer_mtls_enabled && sasl_password.is_none() {
-        return producers;
-    }
 
     for (name, spec) in dynamic_config.kafka_producers() {
         if !spec.enabled {
@@ -598,28 +674,16 @@ async fn build_kafka_producers(cfg: &Config, dynamic_config: &DynamicConfig) -> 
             warn!("kafka producer '{name}' enabled but no topic set; skipping");
             continue;
         };
-        let producer_config = if cfg.kafka_producer_mtls_enabled {
-            match KafkaProducerConfigBuilder::for_cluster_mtls_auto(
-                &cfg.kafka_producer_mtls_cluster,
-                topic.clone(),
-                Some(&cfg.kafka_producer_mtls_zone),
-            ) {
-                Ok(builder) => builder.build(),
-                Err(e) => {
-                    error!("kafka producer '{name}' mTLS config failed; skipping: {e}");
-                    continue;
-                }
+        let producer_config = match KafkaProducerConfigBuilder::for_cluster_mtls_auto(
+            &cfg.kafka_producer_mtls_cluster,
+            topic.clone(),
+            Some(&cfg.kafka_producer_mtls_zone),
+        ) {
+            Ok(builder) => builder.build(),
+            Err(e) => {
+                error!("kafka producer '{name}' mTLS config failed; skipping: {e}");
+                continue;
             }
-        } else {
-            KafkaProducerConfigBuilder::new(conn.dest.clone(), topic.clone())
-                .with_wily_config(WilyConfig::default())
-                .with_ssl(sasl_ssl_config(
-                    &conn,
-                    sasl_password
-                        .as_deref()
-                        .expect("SASL password checked before producer construction"),
-                ))
-                .build()
         };
         let mut producer = KafkaProducer::new(producer_config);
         match producer.start().await {
@@ -663,7 +727,7 @@ impl ScoreResultProcessor {
                 ])
                 .inc();
             publish_decision_outcome(
-                self.ctx.kafka_producer_decisions.as_ref(),
+                &self.ctx,
                 &decision_outcome(
                     score,
                     topic,
@@ -716,7 +780,7 @@ impl ScoreResultProcessor {
                     ])
                     .inc();
                 publish_decision_outcome(
-                    self.ctx.kafka_producer_decisions.as_ref(),
+                    &self.ctx,
                     &decision_outcome(score, topic, "dedup_skipped".into(), false, BTreeMap::new()),
                 );
                 return Ok("dedup_skipped".into());
@@ -1348,6 +1412,10 @@ async fn kafka_health_watchdog(
     }
 }
 
+const KAFKA_PREFLIGHT_ATTEMPTS: u32 = 3;
+const KAFKA_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+const KAFKA_PREFLIGHT_BACKOFF: Duration = Duration::from_secs(2);
+
 async fn probe_broker_reachability(config: KafkaConsumerConfig, timeout: Duration) -> Result<()> {
     use rdkafka::ClientConfig;
     use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -1386,14 +1454,11 @@ pub async fn start_kafka_consumers(
     state: Arc<service::AppState>,
     cfg: &Config,
 ) -> Result<JoinHandle<()>> {
-    let consumer_conn = cfg.kafka_consumer();
-    let Some(sasl_password) = consumer_conn.sasl_password.clone() else {
-        info!(
-            "no Kafka consumer credential (KAFKA_SASL_PASSWORD / KAFKA_CONSUMER_SASL_PASSWORD unset) — Kafka consumer disabled"
-        );
+    if !cfg.kafka_consumer_enabled {
+        info!("KAFKA_CONSUMER_ENABLED=false — Kafka consumer disabled");
         state.kafka_ready.store(true, Ordering::Relaxed);
         return Ok(tokio::spawn(async {}));
-    };
+    }
 
     let growthbook_enabled = cfg.growthbook_url.is_some() && cfg.growthbook_key.is_some();
     let topic_labels_json: serde_json::Value =
@@ -1446,25 +1511,24 @@ pub async fn start_kafka_consumers(
     }
 
     if cfg.kafka_self_delete_enabled && !topics.is_empty() {
-        const PREFLIGHT_ATTEMPTS: u32 = 3;
-        const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
-        const PREFLIGHT_BACKOFF: Duration = Duration::from_secs(2);
-
         let probe_topic = topics.keys().min().expect("topics non-empty").clone();
-        let probe_config: KafkaConsumerConfig = KafkaConsumerBuilder::new(
-            consumer_conn.dest.clone(),
+        let probe_config = KafkaConsumerConfigBuilder::for_cluster_mtls_auto(
+            &cfg.kafka_consumer_mtls_cluster,
             probe_topic.clone(),
             format!("{}-preflight", cfg.kafka_group_id()),
+            Some(&cfg.kafka_consumer_mtls_zone),
         )
-        .with_wily_config(WilyConfig::default())
-        .with_ssl(sasl_ssl_config(&consumer_conn, &sasl_password))
-        .into();
+        .context("failed to configure Phoenix mTLS consumer preflight")?
+        .with_enable_auto_offset_store(false)
+        .with_enable_auto_commit(false)
+        .with_fetch_timeout_ms(10000)
+        .build();
 
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             let start = std::time::Instant::now();
-            match probe_broker_reachability(probe_config.clone(), PREFLIGHT_TIMEOUT).await {
+            match probe_broker_reachability(probe_config.clone(), KAFKA_PREFLIGHT_TIMEOUT).await {
                 Ok(()) => {
                     info!(
                         attempt,
@@ -1474,18 +1538,18 @@ pub async fn start_kafka_consumers(
                     );
                     break;
                 }
-                Err(e) if attempt < PREFLIGHT_ATTEMPTS => {
+                Err(e) if attempt < KAFKA_PREFLIGHT_ATTEMPTS => {
                     warn!(
                         topic = %probe_topic,
-                        "Kafka broker preflight attempt {attempt}/{PREFLIGHT_ATTEMPTS} failed \
-                         (retrying in {PREFLIGHT_BACKOFF:?}): {e:#}"
+                        "Kafka broker preflight attempt {attempt}/{KAFKA_PREFLIGHT_ATTEMPTS} failed \
+                         (retrying in {KAFKA_PREFLIGHT_BACKOFF:?}): {e:#}"
                     );
-                    tokio::time::sleep(PREFLIGHT_BACKOFF).await;
+                    tokio::time::sleep(KAFKA_PREFLIGHT_BACKOFF).await;
                 }
                 Err(e) => {
                     error!(
                         topic = %probe_topic,
-                        "Kafka broker preflight failed after {PREFLIGHT_ATTEMPTS} attempts — \
+                        "Kafka broker preflight failed after {KAFKA_PREFLIGHT_ATTEMPTS} attempts — \
                          likely a bad node; self-deleting to reschedule: {e:#}"
                     );
                     metrics::KAFKA_SELF_DELETE_TOTAL
@@ -1493,7 +1557,7 @@ pub async fn start_kafka_consumers(
                         .inc();
                     self_delete_pod().await;
                     return Err(anyhow::anyhow!(
-                        "Kafka broker preflight failed after {PREFLIGHT_ATTEMPTS} attempts: {e:#}"
+                        "Kafka broker preflight failed after {KAFKA_PREFLIGHT_ATTEMPTS} attempts: {e:#}"
                     ));
                 }
             }
@@ -1570,6 +1634,7 @@ pub async fn start_kafka_consumers(
         rules_cache: state.rules_cache.clone(),
         allowlist: state.allowlist.clone(),
         kafka_producer_decisions: state.kafka_producers.decisions().cloned(),
+        kafka_producer_decisions_json: state.kafka_producers.decisions_json().cloned(),
     };
 
     {
@@ -1696,22 +1761,25 @@ pub async fn start_kafka_consumers(
         max_in_flight, "Kafka consumer batch limits"
     );
 
-    let make_batch_config = |topic: &str| {
-        let kafka = KafkaConsumerBuilder::new(
-            consumer_conn.dest.clone(),
+    let make_batch_config = |topic: &str| -> Result<BatchConsumerConfig> {
+        let kafka = KafkaConsumerConfigBuilder::for_cluster_mtls_auto(
+            &cfg.kafka_consumer_mtls_cluster,
             topic.to_owned(),
-            format!("{}-{}", kafka_group_id, topic),
+            topic_consumer_group_id(&kafka_group_id, topic),
+            Some(&cfg.kafka_consumer_mtls_zone),
         )
-        .with_wily_config(WilyConfig::default())
-        .with_ssl(sasl_ssl_config(&consumer_conn, &sasl_password))
-        .with_fetch_timeout_ms(10000);
+        .with_context(|| format!("failed to configure Phoenix mTLS consumer for {topic}"))?
+        .with_enable_auto_offset_store(false)
+        .with_enable_auto_commit(false)
+        .with_fetch_timeout_ms(10000)
+        .build();
 
-        BatchConsumerConfig::new(kafka, SERVICE_NAME)
-            .with_max_messages_per_poll(max_messages_per_poll)
+        Ok(BatchConsumerConfig::new(kafka, SERVICE_NAME)
+            .with_max_messages_per_poll(max_messages_per_poll))
     };
 
     for (topic, topic_cfg) in topics {
-        let batch_config = make_batch_config(&topic);
+        let batch_config = make_batch_config(&topic)?;
         let cancel = cancel.clone();
 
         match topic_cfg {
@@ -1779,6 +1847,10 @@ pub async fn start_kafka_consumers(
             let _ = h.await;
         }
     }))
+}
+
+fn topic_consumer_group_id(base_group_id: &str, topic: &str) -> String {
+    format!("{base_group_id}-{topic}")
 }
 
 pub async fn serve(router: Router, cfg: &Config) -> Result<()> {
@@ -1853,6 +1925,36 @@ mod router_split_tests {
 }
 
 #[cfg(test)]
+mod kafka_topic_config_tests {
+    use super::{
+        KAFKA_PREFLIGHT_ATTEMPTS, KAFKA_PREFLIGHT_BACKOFF, KAFKA_PREFLIGHT_TIMEOUT,
+        topic_consumer_group_id,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn dynamic_topics_keep_distinct_existing_group_ids() {
+        let base_group_id = "xai-abuse-enforcement-service";
+
+        assert_eq!(
+            topic_consumer_group_id(base_group_id, "scores.primary"),
+            "xai-abuse-enforcement-service-scores.primary"
+        );
+        assert_eq!(
+            topic_consumer_group_id(base_group_id, "scores.secondary"),
+            "xai-abuse-enforcement-service-scores.secondary"
+        );
+    }
+
+    #[test]
+    fn preflight_retry_budget_stays_bounded() {
+        assert_eq!(KAFKA_PREFLIGHT_ATTEMPTS, 3);
+        assert_eq!(KAFKA_PREFLIGHT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(KAFKA_PREFLIGHT_BACKOFF, Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
 mod dedup_retention_tests {
     use super::outcome_holds_full_dedup;
 
@@ -1862,6 +1964,7 @@ mod dedup_retention_tests {
         for skip in [
             "dry_run", 
             "dedup_skipped",
+            "very_high_follower_count",
             "high_follower_count",
             "pagerank_skipped",
             "gizmoduck_skipped",
@@ -1872,9 +1975,172 @@ mod dedup_retention_tests {
             "rule_eval_error",
             "max_enforcement_reached",
             "invalid_entity_id",
+            "requested_actions_denied",
+            "platform_row_without_requested_actions",
         ] {
             assert!(!outcome_holds_full_dedup(skip), "{skip} must not hold 24h");
         }
+    }
+}
+
+#[cfg(test)]
+mod generic_dispatch_tests {
+    use super::*;
+    use crate::decision::ActionSpec;
+    use crate::facts::RequestedActionFacts;
+    use crate::generic_actions::GenericActionAllowlist;
+
+    fn score_facts_with(requested: Vec<RequestedActionFacts>) -> ScoreFacts {
+        let mut f = ScoreFacts::from_score(&abuse_proto::ScoreResult::default());
+        f.requested_actions = requested;
+        f
+    }
+
+    fn user_allowlist() -> GenericActionAllowlist {
+        GenericActionAllowlist {
+            kinds: ["suspend", "label"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            suspend_policies: ["PlatformManipulation"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            labels: ["SpamHighRecall"].iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+            #[test]
+    fn expand_allowed_requested_actions_yields_plain_act_decision() {
+        let facts = score_facts_with(vec![RequestedActionFacts {
+            kind: "suspend".into(),
+            perm: false,
+            policy: "PlatformManipulation".into(),
+            head: "IsSpammer".into(),
+            ..Default::default()
+        }]);
+        let (decision, skipped) =
+            expand_requested_actions_decision(EntityType::User, &facts, &user_allowlist());
+        assert_eq!(
+            decision,
+            ExpandedDecision::Act(vec![ActionSpec::SuspendUser {
+                perm: false,
+                policy: "PlatformManipulation".into(),
+            }])
+        );
+        assert!(skipped.is_none());
+    }
+
+    #[test]
+    fn expand_denied_requested_actions_yields_skip_with_reason() {
+        let facts = score_facts_with(vec![RequestedActionFacts {
+            kind: "suspend".into(),
+            policy: "PlatformManipulation".into(),
+            head: "IsSpammer".into(),
+            ..Default::default()
+        }]);
+        let (decision, skipped) = expand_requested_actions_decision(
+            EntityType::User,
+            &facts,
+            &GenericActionAllowlist::default(),
+        );
+        assert_eq!(
+            decision,
+            ExpandedDecision::Skip(REQUESTED_ACTIONS_DENIED.into())
+        );
+        let skipped = skipped.expect("refused entries must be reported");
+        assert!(skipped.contains("kind_not_allowlisted"), "{skipped}");
+    }
+
+    #[test]
+    fn expand_empty_requested_actions_yields_skip() {
+        let (decision, skipped) = expand_requested_actions_decision(
+            EntityType::User,
+            &score_facts_with(vec![]),
+            &user_allowlist(),
+        );
+        assert_eq!(
+            decision,
+            ExpandedDecision::Skip(REQUESTED_ACTIONS_DENIED.into())
+        );
+        assert!(skipped.is_none());
+    }
+
+    #[test]
+    fn expand_partial_allowlist_dispatches_allowed_and_reports_skipped() {
+        let facts = score_facts_with(vec![
+            RequestedActionFacts {
+                kind: "label".into(),
+                labels: vec!["SpamHighRecall".into()],
+                ttl_msec: 1000,
+                head: "IsLabelHead".into(),
+                ..Default::default()
+            },
+            RequestedActionFacts {
+                kind: "bounce_captcha".into(), 
+                head: "IsCuspHead".into(),
+                ..Default::default()
+            },
+        ]);
+        let (decision, skipped) =
+            expand_requested_actions_decision(EntityType::User, &facts, &user_allowlist());
+        assert_eq!(
+            decision,
+            ExpandedDecision::Act(vec![ActionSpec::AddLabelsV2 {
+                labels: vec!["SpamHighRecall".into()],
+                ttl_msec: Some(1000),
+            }])
+        );
+        let skipped = skipped.expect("refused entry must be reported");
+        assert!(skipped.contains("bounce_captcha"), "{skipped}");
+        assert!(skipped.contains("kind_not_allowlisted"), "{skipped}");
+    }
+}
+
+#[cfg(test)]
+mod decision_outcome_json_tests {
+    use super::*;
+    use xai_abuse_proto::enforcement::{
+        EntityType as ProtoEntityType, FiredHead, ScoreResult, SummaryCounters,
+    };
+
+                        #[test]
+    fn decision_outcome_json_mirror_carries_funnel_fields() {
+        let score = ScoreResult {
+            user_id: 100,
+            model_version: "my_model@1".into(),
+            entity_type: ProtoEntityType::Post as i32,
+            entity_id: 555,
+            summary: Some(SummaryCounters {
+                labels: vec!["my_model_threshold_reached".into()],
+                fired_heads: vec![FiredHead {
+                    name: "IsSpamPost".into(),
+                    score: 0.99,
+                    threshold: 0.9,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut info = BTreeMap::new();
+        info.insert(
+            "action_kinds".to_owned(),
+            r#"["addPostLabelsV2"]"#.to_owned(),
+        );
+        let outcome = decision_outcome(&score, "some.topic", "success".into(), true, info);
+        let v = serde_json::to_value(&outcome).expect("DecisionOutcome serializes to JSON");
+
+        assert!(v["decided_at_ms"].as_i64().unwrap() > 0);
+        assert_eq!(v["source_topic"], "some.topic");
+        assert_eq!(v["entity_type"], "post");
+        assert_eq!(v["entity_id"], 555);
+        assert_eq!(v["model_version"], "my_model@1");
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["head"], "IsSpamPost");
+        assert_eq!(v["fired_heads"][0]["name"], "IsSpamPost");
+        assert_eq!(v["labels"][0], "my_model_threshold_reached");
+        assert_eq!(v["info"]["action_kinds"], r#"["addPostLabelsV2"]"#);
     }
 }
 

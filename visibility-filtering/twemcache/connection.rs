@@ -56,6 +56,7 @@ impl Shared {
             return;
         }
         self.metrics.record_connection_event(ConnEvent::TornDown);
+        #[expect(clippy::unwrap_used, reason = "propagate FIFO-lock poisoning")]
         let mut q = self.pending.lock().unwrap();
         while let Some(p) = q.pop_front() {
             p.fail(err.clone());
@@ -176,6 +177,10 @@ impl PipelinedConnection {
         let len = 4 + key_bytes.len() + 2;
         let mut stack_buf = [0u8; 256 + 6];
         let fallback;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "this arm requires len <= stack_buf.len()"
+        )]
         let cmd: &[u8] = if len <= stack_buf.len() {
             stack_buf[..4].copy_from_slice(b"get ");
             stack_buf[4..4 + key_bytes.len()].copy_from_slice(key_bytes);
@@ -192,6 +197,7 @@ impl PipelinedConnection {
                 return Err(TwemcacheError::Unavailable);
             }
             {
+                #[expect(clippy::unwrap_used, reason = "propagate FIFO-lock poisoning")]
                 let mut q = self.shared.pending.lock().unwrap();
                 q.push_back(Pending::Get(tx));
                 self.shared.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -234,6 +240,7 @@ async fn dispatch_version(
             return Err(TwemcacheError::Unavailable);
         }
         {
+            #[expect(clippy::unwrap_used, reason = "propagate FIFO-lock poisoning")]
             let mut q = shared.pending.lock().unwrap();
             q.push_back(Pending::Version(tx));
             shared.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -308,6 +315,7 @@ async fn reader_loop(
 
 fn deliver(shared: &Shared, reply: Reply) -> std::result::Result<(), ()> {
     let pending = {
+        #[expect(clippy::unwrap_used, reason = "propagate FIFO-lock poisoning")]
         let mut q = shared.pending.lock().unwrap();
         match q.pop_front() {
             Some(p) => {
@@ -367,15 +375,18 @@ async fn read_one_reply<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Optio
     }
 
     let parts: Vec<&str> = header.split_whitespace().collect();
-    if parts.len() < 4 || parts[0] != "VALUE" {
-        return Err(TwemcacheError::Io(format!(
-            "unexpected response: {header:?}"
-        )));
-    }
-    let _flags: u32 = parts[2]
+    let (flags_part, byte_count_part) = match parts.as_slice() {
+        ["VALUE", _key, flags, byte_count, ..] => (*flags, *byte_count),
+        _ => {
+            return Err(TwemcacheError::Io(format!(
+                "unexpected response: {header:?}"
+            )));
+        }
+    };
+    let _flags: u32 = flags_part
         .parse()
         .map_err(|_| TwemcacheError::Io(format!("invalid flags: {header:?}")))?;
-    let byte_count: usize = parts[3]
+    let byte_count: usize = byte_count_part
         .parse()
         .map_err(|_| TwemcacheError::Io(format!("invalid byte count: {header:?}")))?;
 
@@ -412,8 +423,9 @@ pub fn build_mtls_connector(
     use tokio_rustls::client::TlsConnector;
     use tokio_rustls::rustls::{client::ClientConfig, RootCertStore};
 
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
 
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_cert_path)? {
@@ -483,7 +495,7 @@ impl ChainVerifyingSkipNameVerifier {
     fn new(roots: Arc<rustls::RootCertStore>) -> Result<Self> {
         let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
             roots,
-            Arc::new(rustls::crypto::ring::default_provider()),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
         )
         .build()
         .map_err(|e| TwemcacheError::Io(format!("build server cert verifier: {e}")))?;
